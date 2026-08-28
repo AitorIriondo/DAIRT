@@ -1,0 +1,12 @@
+# Grounding encoder/decoder
+
+The head (6+6 layers, width 256) runs in fp16 TensorRT with its own fusions; its per-class cost is reduced by exact restructuring:
+
+- **Prefix sharing.** Encoder layer 0's self-attention block depends only on the image. `export/split_ground_prefix.py` (K=1 export) and `export/split_ground_c16.py` (class-bucket export) produce a prefix engine (img_feat, img_pos → x1, pos; 3 ms per image) and a post engine that expands x1/pos to the K prompts of a bucket. K=16: 387 → 351 ms, bit-identical outputs. `runtime/eval_pipeline.py --ground <post.plan> --ground-pre <pre.plan>` evaluates the pair.
+- **CUDA-graph replay.** `patches/runner_cuda_graph.patch` adds `LQ_CUDA_GRAPH=1` to the DART TensorRT runner: one capture of `enqueueV3`, replayed per call. Roughly 1 ms per engine call (trunk 164.0 → 162.6 ms).
+
+`scripts/head_pipeline.sh` runs the split, the builds and the comparison against the monolithic bucket engine.
+
+## Segmentation head (`demo/export_ground_mask.py`)
+
+The DART grounding export emits scores, boxes and presence only; the SAM3 segmentation head also needs the last decoder layer's queries and the encoder's output (the pixel decoder replaces the coarsest FPN level with the encoder states, which are prompt-conditioned, and cross-attends them to the prompt). `export_ground_mask.py` re-exports the grounding bucket with two extra outputs, `hs` [K, 200, 256] and `enc` [5184, K, 256], and exports the head itself as `maskhead_qQ.onnx` with inputs `fpn_0`, `fpn_1` (bound directly to the vision engine's device buffers at run time), `enc`, `text_feats`, `text_mask` and `hs_sel` [K, Q, 256]. The prompt axis K is dynamic (`demo/build_mask_engine.py` builds an FP16 plan with a min/opt/max profile), so the head runs only for prompts that produced a detection, and only for the Q highest-scoring queries of each (Q = 32 by default). The outputs are the head's own logits at the 288 x 288 grid. The demo runner suppresses duplicates and nested parts by mask IoU and containment across prompts and queries, drops group boxes that contain two confident objects, and feeds the rest to a lightweight tracker (Hungarian matching on mask IoU with low-score continuation, short coasting, smoothed masks and a class vote per track), so labels and identities are stable from frame to frame; boxes are drawn from the smoothed masks. The text encoder runs once per prompt set; the detector head is image-conditioned and runs per frame.

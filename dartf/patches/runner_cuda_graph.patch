@@ -1,0 +1,38 @@
+--- runner/main.cpp.orig	2026-08-27 20:54:04.017789294 -0400
++++ runner/main.cpp	2026-08-27 20:54:04.037789531 -0400
+@@ -479,12 +479,26 @@
+       }
+       check_cuda(cudaStreamSynchronize(stream), "warmup synchronization");
+ 
++      // LQ: optional CUDA-graph capture/replay of the whole enqueue (exact; removes per-kernel launch gaps). Enable with LQ_CUDA_GRAPH=1.
++      cudaGraphExec_t graph_exec = nullptr;
++      if (std::getenv("LQ_CUDA_GRAPH") != nullptr && std::string(std::getenv("LQ_CUDA_GRAPH")) == "1") {
++        cudaGraph_t graph = nullptr;
++        check_cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "cudaStreamBeginCapture");
++        if (!context->enqueueV3(stream)) throw std::runtime_error("capture enqueueV3 failed");
++        check_cuda(cudaStreamEndCapture(stream, &graph), "cudaStreamEndCapture");
++        check_cuda(cudaGraphInstantiate(&graph_exec, graph, 0), "cudaGraphInstantiate");
++        cudaGraphDestroy(graph);
++        check_cuda(cudaGraphLaunch(graph_exec, stream), "graph warm launch");
++        check_cuda(cudaStreamSynchronize(stream), "graph warm synchronization");
++      }
++
+       std::vector<float> samples;
+       samples.reserve(static_cast<size_t>(arguments.iterations));
+       auto const wall_start = std::chrono::steady_clock::now();
+       for (int32_t index = 0; index < arguments.iterations; ++index) {
+         check_cuda(cudaEventRecord(begin, stream), "record begin");
+-        if (!context->enqueueV3(stream)) throw std::runtime_error("measured enqueueV3 failed");
++        if (graph_exec != nullptr) check_cuda(cudaGraphLaunch(graph_exec, stream), "graph launch");
++        else if (!context->enqueueV3(stream)) throw std::runtime_error("measured enqueueV3 failed");
+         check_cuda(cudaEventRecord(end, stream), "record end");
+         check_cuda(cudaEventSynchronize(end), "synchronize end");
+         float elapsed{};
+@@ -501,6 +515,7 @@
+         }
+       }
+       check_cuda(cudaStreamSynchronize(stream), "output synchronization");
++      if (graph_exec != nullptr) cudaGraphExecDestroy(graph_exec);
+       destroy_cuda();
+ 
+       std::vector<Comparison> comparisons;

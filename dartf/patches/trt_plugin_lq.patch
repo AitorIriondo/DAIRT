@@ -1,0 +1,26 @@
+--- src/trt_plugin.cpp.orig	2026-08-27 14:21:17.264114193 -0400
++++ src/trt_plugin.cpp	2026-08-27 14:21:17.296114715 -0400
+@@ -1,6 +1,9 @@
+ #include "latticeq_orin/backend.hpp"
+ 
+ #include <NvInferPlugin.h>
++#include <dlfcn.h>
++#include <cstdlib>
++#include <string>
+ #include <NvInferRuntime.h>
+ 
+ #include <array>
+@@ -358,6 +361,13 @@
+  public:
+   W8A8LinearRegistrar() noexcept {
+     ::getPluginRegistry()->registerCreator(creator_, kPluginNamespace);
++    // Also load the LQ CUTLASS plugin library (LQFc1Gelu, LQGemmRope) so that engines whose ONNX uses the
++    // custom ops (RoPE-in-epilogue q/k GEMMs, fused fc1) build and deserialize through the same loader.
++    char const* extra = std::getenv("LQ_EXTRA_PLUGINS");
++    std::string path = extra != nullptr ? extra : std::string(std::getenv("HOME") ? std::getenv("HOME") : "/home/cs32") + "/w8a8/plugins/lq_plugins2.so";
++    if (void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL)) {
++      if (auto f = reinterpret_cast<void (*)()>(dlsym(h, "lq_register"))) f();
++    }
+   }
+ 
+  private:

@@ -1,0 +1,428 @@
+--- a/run_orin.sh
++++ b/run_orin.sh
+@@ -117,7 +117,7 @@
+     for sensor in /sys/class/thermal/thermal_zone*/type /sys/class/thermal/thermal_zone*/temp; do
+       if [[ -r "${sensor}" ]]; then
+         printf '%s=' "${sensor}"
+-        cat "${sensor}"
++        cat "${sensor}" 2>&1 || true
+       fi
+     done
+     for clock in /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq \
+@@ -125,7 +125,7 @@
+                  /sys/class/devfreq/*/max_freq; do
+       if [[ -r "${clock}" ]]; then
+         printf '%s=' "${clock}"
+-        cat "${clock}"
++        cat "${clock}" 2>&1 || true
+       fi
+     done
+   } > "${OUTPUT_DIR}/platform.txt" 2>&1
+@@ -164,16 +164,63 @@
+   else
+     ONNX_DIR="${HANDOFF_DIR}"
+   fi
+-  require_file "${ONNX_DIR}/vision_1008.onnx"
+   require_file "${ONNX_DIR}/text_c16.onnx"
+   require_file "${ONNX_DIR}/ground_c16.onnx"
+ }
+ 
++# Baseline precision per route. text_c16 is built FP32: it runs once per prompt set
++# (~41 ms vs ~14 ms FP16 on AGX Orin) and FP16 drifts on padded token positions
++# beyond the frozen per-element golden tolerance. vision/ground stay FP16.
++plan_precision() {
++  case "$1" in
++    text_c16) echo fp32 ;;
++    *) echo fp16 ;;
++  esac
++}
++
++# Vision route. TensorRT 10.16 on SM87 miscompiles the trunk's qkv-split/RoPE fusion in every precision and the
++# FP16 attention@V MatMul is numerically wrong, so the vision plan always needs --break-fusion and either
++#   int8 (default): explicit Q/DQ INT8 graph assets/vision_1008_int8.onnx (W8 blocks 1-31, A8 proj everywhere +
++#                   all GEMMs from block 8; ~220 ms; detection-level agreement with FP32 within noise), or
++#   fp16: assets/vision_1008.onnx with attention@V/Softmax/LayerNorm pinned to FP32 (correct, ~466 ms).
++#   hf16: assets/vision_1008_hf.onnx — the DART/HuggingFace export of the same weights (explicit Q·Kᵀ, real-valued
++#         RoPE). Correct in plain FP16 on TensorRT 10.16 with no breaker/pinning (~275 ms).
++#   hfint8 (recommended): assets/vision_1008_hf_int8.onnx — same recipe as int8 on the HF graph (~229 ms).
++# Select with LQ_VISION_MODE=int8|fp16|hf16|hfint8 (default hfint8).
++VISION_MODE="${LQ_VISION_MODE:-hfint8}"
++vision_onnx() {
++  case "${VISION_MODE}" in
++    int8) echo "${ONNX_DIR}/vision_1008_int8.onnx" ;;
++    fp16) echo "${ONNX_DIR}/vision_1008.onnx" ;;
++    hf16) echo "${ONNX_DIR}/vision_1008_hf.onnx" ;;
++    hfint8) echo "${ONNX_DIR}/vision_1008_hf_int8.onnx" ;;
++    *) echo "unknown LQ_VISION_MODE: ${VISION_MODE}" >&2; return 1 ;;
++  esac
++}
++vision_builder_flags() {
++  case "${VISION_MODE}" in
++    int8) echo "--precision int8 --break-fusion" ;;
++    fp16) echo "--precision fp16 --fp32-attention --break-fusion" ;;
++    hf16) echo "--precision fp16" ;;
++    hfint8) echo "--precision int8" ;;
++  esac
++}
++
+ build_fp16_engines() {
+   resolve_onnx_dir
+   mkdir -p "${OUTPUT_DIR}/engine"
+   local plan
+-  for plan in vision_1008 text_c16 ground_c16; do
++  CURRENT_STAGE="vision_engine_build_${VISION_MODE}"
++  require_file "$(vision_onnx)"
++  # shellcheck disable=SC2046
++  "${BUILD_DIR}/latticeq_orin_engine_builder" \
++    --config "${TARGET_CONFIG}" \
++    --onnx "$(vision_onnx)" \
++    --engine "${OUTPUT_DIR}/engine/vision_1008.plan" \
++    --timing-cache "${OUTPUT_DIR}/engine/vision_1008.${VISION_MODE}.timing.cache" \
++    --plugin "${BUILD_DIR}/liblatticeq_orin_trt_plugin.so" \
++    $(vision_builder_flags)
++  for plan in text_c16 ground_c16; do
+     CURRENT_STAGE="fp16_engine_build_${plan}"
+     "${BUILD_DIR}/latticeq_orin_engine_builder" \
+       --config "${TARGET_CONFIG}" \
+@@ -181,7 +228,7 @@
+       --engine "${OUTPUT_DIR}/engine/${plan}.plan" \
+       --timing-cache "${OUTPUT_DIR}/engine/${plan}.timing.cache" \
+       --plugin "${BUILD_DIR}/liblatticeq_orin_trt_plugin.so" \
+-      --precision fp16
++      --precision "$(plan_precision "${plan}")"
+   done
+   FP16_PLANS_BUILT=3
+ }
+--- a/cmake/FindTensorRT.cmake
++++ b/cmake/FindTensorRT.cmake
+@@ -27,6 +27,11 @@
+   foreach(_part MAJOR MINOR PATCH BUILD)
+     string(REGEX MATCH "#define[ \t]+NV_TENSORRT_${_part}[ \t]+([0-9]+)"
+       _match_${_part} "${_TensorRT_VERSION_HEADER}")
++    if(NOT CMAKE_MATCH_1)
++      # TensorRT >= 10.x aliases NV_TENSORRT_* to TRT_*_ENTERPRISE literals.
++      string(REGEX MATCH "#define[ \t]+TRT_${_part}_ENTERPRISE[ \t]+([0-9]+)"
++        _match_${_part} "${_TensorRT_VERSION_HEADER}")
++    endif()
+     set(TensorRT_VERSION_${_part} "${CMAKE_MATCH_1}")
+   endforeach()
+   set(TensorRT_VERSION
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -33,7 +33,8 @@
+ function(lq_orin_target_defaults target)
+   target_compile_options(${target} PRIVATE
+     $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Wpedantic>
+-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Wpedantic;-lineinfo>)
++    # -Wpedantic is omitted for CUDA: nvcc-generated #line directives trip it under -Werror.
++    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra;-lineinfo>)
+   if(LQ_ORIN_WARNINGS_AS_ERRORS)
+     target_compile_options(${target} PRIVATE
+       $<$<COMPILE_LANGUAGE:CXX>:-Werror>
+@@ -111,7 +112,7 @@
+ add_test(NAME native_config COMMAND native_config_test "${CMAKE_CURRENT_SOURCE_DIR}/target.toml")
+ 
+ add_executable(native_registry_test tests/native_registry_test.cpp)
+-target_link_libraries(native_registry_test PRIVATE TensorRT::nvinfer ${CMAKE_DL_LIBS})
++target_link_libraries(native_registry_test PRIVATE TensorRT::nvinfer CUDA::cudart ${CMAKE_DL_LIBS})
+ lq_orin_target_defaults(native_registry_test)
+ add_test(NAME native_registry COMMAND native_registry_test
+   "$<TARGET_FILE:latticeq_orin_trt_plugin>")
+--- a/include/latticeq_orin/config.hpp
++++ b/include/latticeq_orin/config.hpp
+@@ -28,6 +28,7 @@
+   int32_t autotune_warmup_iterations{};
+   int32_t autotune_measurement_iterations{};
+   int32_t autotune_workspace_mib{};
++  int32_t engine_workspace_mib{};
+   int32_t benchmark_warmup_iterations{};
+   int32_t benchmark_measurement_iterations{};
+ };
+--- a/src/config.cpp
++++ b/src/config.cpp
+@@ -123,7 +123,7 @@
+     if (line.front() == '[' && line.back() == ']') {
+       section = trim(line.substr(1, line.size() - 2));
+       if (section != "target" && section != "plugin" && section != "autotune" &&
+-          section != "benchmark") {
++          section != "benchmark" && section != "engine") {
+         throw std::runtime_error("target.toml line " + std::to_string(line_number) +
+                                  ": unknown section " + section);
+       }
+@@ -160,6 +160,7 @@
+     else if (key == "autotune.warmup_iterations") config.autotune_warmup_iterations = parse_int(value, line_number);
+     else if (key == "autotune.measurement_iterations") config.autotune_measurement_iterations = parse_int(value, line_number);
+     else if (key == "autotune.workspace_mib") config.autotune_workspace_mib = parse_int(value, line_number);
++    else if (key == "engine.workspace_mib") config.engine_workspace_mib = parse_int(value, line_number);
+     else if (key == "benchmark.warmup_iterations") config.benchmark_warmup_iterations = parse_int(value, line_number);
+     else if (key == "benchmark.measurement_iterations") config.benchmark_measurement_iterations = parse_int(value, line_number);
+     else {
+@@ -201,6 +202,7 @@
+   require_positive(errors, "autotune.warmup_iterations", config.autotune_warmup_iterations);
+   require_positive(errors, "autotune.measurement_iterations", config.autotune_measurement_iterations);
+   require_positive(errors, "autotune.workspace_mib", config.autotune_workspace_mib);
++  require_positive(errors, "engine.workspace_mib", config.engine_workspace_mib);
+   require_positive(errors, "benchmark.warmup_iterations", config.benchmark_warmup_iterations);
+   require_positive(errors, "benchmark.measurement_iterations", config.benchmark_measurement_iterations);
+   return errors;
+--- a/src/diagnostics.cpp
++++ b/src/diagnostics.cpp
+@@ -53,7 +53,7 @@
+   append_cuda_error(report.errors, "cudaGetDeviceCount", cudaGetDeviceCount(&report.device_count));
+ 
+   report.tensorrt_compile_version = NV_TENSORRT_VERSION;
+-  report.tensorrt_runtime_version = nvinfer1::getInferLibVersion();
++  report.tensorrt_runtime_version = ::getInferLibVersion();
+ 
+   if (report.device_count > 0) {
+     append_cuda_error(report.errors, "cudaGetDevice", cudaGetDevice(&report.device_index));
+--- a/src/engine_builder.cpp
++++ b/src/engine_builder.cpp
+@@ -33,6 +33,8 @@
+   std::string timing_cache;
+   std::string plugin;
+   std::string precision{"fp16"};
++  bool fp32_attention{false};
++  bool break_fusion{false};
+ };
+ 
+ std::vector<char> read_binary(std::string const& path, bool optional = false) {
+@@ -73,10 +75,16 @@
+     else if (token == "--timing-cache") arguments.timing_cache = value("--timing-cache");
+     else if (token == "--plugin") arguments.plugin = value("--plugin");
+     else if (token == "--precision") arguments.precision = value("--precision");
++    else if (token == "--fp32-attention") arguments.fp32_attention = true;
++    else if (token == "--break-fusion") arguments.break_fusion = true;
+     else if (token == "--help") {
+       std::cout << "usage: latticeq_orin_engine_builder --config target.toml --onnx model.onnx "
+                    "--engine model.plan --timing-cache tactics.bin [--plugin plugin.so] "
+-                   "[--precision fp16|w8a8]\n";
++                   "[--precision fp16|fp32|int8|w8a8] [--fp32-attention]\n"
++                   "  int8: explicit Q/DQ INT8 graph (TensorRT-native), FP16 elsewhere\n"
++                   "  --fp32-attention: pin attention@V MatMul, Softmax and LayerNorm to FP32 (DART attn-v-only)\n"
++                   "  --break-fusion: insert Add(x,0) after each trunk block's attention V tensor; works around\n"
++                   "                  the TensorRT 10.16/SM87 miscompiled qkv-split/RoPE fusion (required for correct output)\n";
+       std::exit(0);
+     } else {
+       throw std::runtime_error("unknown argument: " + token);
+@@ -86,8 +94,9 @@
+       arguments.timing_cache.empty()) {
+     throw std::runtime_error("--config, --onnx, --engine, and --timing-cache are required");
+   }
+-  if (arguments.precision != "fp16" && arguments.precision != "w8a8") {
+-    throw std::runtime_error("--precision must be fp16 or w8a8");
++  if (arguments.precision != "fp16" && arguments.precision != "fp32" &&
++      arguments.precision != "int8" && arguments.precision != "w8a8") {
++    throw std::runtime_error("--precision must be fp16, fp32, int8, or w8a8");
+   }
+   if (arguments.precision == "w8a8" && arguments.plugin.empty()) {
+     throw std::runtime_error("W8A8 engine construction requires --plugin");
+@@ -133,7 +142,7 @@
+       config.plugin_version != version() || config.plugin_namespace != plugin_namespace()) {
+     throw std::runtime_error("plugin ABI or identity validation failed");
+   }
+-  auto* const creator = nvinfer1::getPluginRegistry()->getCreator(
++  auto* const creator = ::getPluginRegistry()->getCreator(
+       config.plugin_name.c_str(), config.plugin_version.c_str(), config.plugin_namespace.c_str());
+   if (creator == nullptr) throw std::runtime_error("TensorRT V3 plugin creator is not registered");
+   if (require_backend && ready() != 1) {
+@@ -231,8 +240,9 @@
+     latticeq::orin::TensorRtLogger logger(nvinfer1::ILogger::Severity::kINFO);
+     TrtPtr<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(logger));
+     if (!builder) throw std::runtime_error("createInferBuilder failed");
+-    uint32_t const network_flags =
+-        1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
++    // TensorRT 10 networks are always explicit-batch; the kEXPLICIT_BATCH flag is a
++    // deprecated no-op there, so pass no creation flags (identical semantics).
++    uint32_t const network_flags = 0U;
+     TrtPtr<nvinfer1::INetworkDefinition> network(builder->createNetworkV2(network_flags));
+     TrtPtr<nvonnxparser::IParser> parser(nvonnxparser::createParser(*network, logger));
+     TrtPtr<nvinfer1::IBuilderConfig> builder_config(builder->createBuilderConfig());
+@@ -244,16 +254,95 @@
+       throw std::runtime_error("ONNX parse failed");
+     }
+     reject_bf16(*network);
++    if (arguments.break_fusion) {
++      // Materialize each block's V tensor through an explicit Add(x, 0): TensorRT 10.16 on SM87 miscompiles the
++      // fused Split/Squeeze/Cast/RoPE/Transpose region otherwise (FP32 cos 0.57, FP16 cos 0.07 vs PyTorch).
++      static float const kZero = 0.0F;
++      nvinfer1::Weights const zero{nvinfer1::DataType::kFLOAT, &kZero, 1};
++      std::vector<nvinfer1::ITensor*> targets;
++      for (int32_t index = 0; index < network->getNbLayers(); ++index) {
++        auto* const layer = network->getLayer(index);
++        for (int32_t output = 0; output < layer->getNbOutputs(); ++output) {
++          auto* const tensor = layer->getOutput(output);
++          std::string const name = tensor->getName() == nullptr ? "" : tensor->getName();
++          static std::string const kSuffix = "/attn/Cast_6_output_0";
++          if (name.rfind("/trunk/blocks.", 0) == 0 && name.size() > kSuffix.size() &&
++              name.compare(name.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0) {
++            targets.push_back(tensor);
++          }
++        }
++      }
++      int32_t const layer_count = network->getNbLayers();
++      for (auto* const tensor : targets) {
++        nvinfer1::Dims dims = tensor->getDimensions();
++        for (int32_t d = 0; d < dims.nbDims; ++d) dims.d[d] = 1;
++        auto* const constant = network->addConstant(dims, zero);
++        auto* const add = network->addElementWise(*tensor, *constant->getOutput(0),
++                                                  nvinfer1::ElementWiseOperation::kSUM);
++        std::string const break_name = std::string(tensor->getName()) + "_fusion_break";
++        add->setName(break_name.c_str());
++        auto* const replacement = add->getOutput(0);
++        for (int32_t index = 0; index < layer_count; ++index) {
++          auto* const consumer = network->getLayer(index);
++          for (int32_t input = 0; input < consumer->getNbInputs(); ++input) {
++            if (consumer->getInput(input) == tensor) consumer->setInput(input, *replacement);
++          }
++        }
++      }
++      if (targets.size() != 32U) {
++        throw std::runtime_error("--break-fusion expected 32 trunk V tensors, found " +
++                                 std::to_string(targets.size()));
++      }
++      std::cerr << "engine_builder: inserted " << targets.size() << " fusion breakers\n";
++    }
+     int32_t w8a8_plugin_layers = 0;
+     if (arguments.precision == "w8a8") {
+       w8a8_plugin_layers = validate_w8a8_coverage(*network, target);
+     }
+ 
+-    builder_config->setFlag(nvinfer1::BuilderFlag::kFP16);
+-    if (arguments.precision == "w8a8") builder_config->setFlag(nvinfer1::BuilderFlag::kINT8);
++    // BuilderFlag::kFP16/kINT8 are deprecated in TensorRT 10.16 in favour of strongly
++    // typed networks, but they remain functional. The handoff freezes the weakly typed
++    // FP16 baseline semantics, so keep the flags and only silence the deprecation warning.
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
++    // fp32: no reduced-precision flags; the ONNX boundary casts still fix I/O dtypes.
++    // Used for text_c16, whose 24-layer transformer drifts on padded tokens in FP16
++    // and which runs once per prompt set rather than per frame.
++    if (arguments.precision != "fp32") builder_config->setFlag(nvinfer1::BuilderFlag::kFP16);
++    if (arguments.precision == "w8a8" || arguments.precision == "int8") {
++      builder_config->setFlag(nvinfer1::BuilderFlag::kINT8);
++    }
++#pragma GCC diagnostic pop
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
++    if (arguments.fp32_attention) {
++      // DART "attn-v-only": the FP16 attention@V MatMul (5184-token accumulation) is numerically wrong on
++      // SM87/TensorRT 10.16; pin it plus Softmax and LayerNorm to FP32 and obey the constraints.
++      int32_t pinned = 0;
++      for (int32_t index = 0; index < network->getNbLayers(); ++index) {
++        auto* const layer = network->getLayer(index);
++        std::string const name = layer->getName() == nullptr ? "" : layer->getName();
++        bool const pin = layer->getType() == nvinfer1::LayerType::kSOFTMAX ||
++                         layer->getType() == nvinfer1::LayerType::kNORMALIZATION ||
++                         (layer->getType() == nvinfer1::LayerType::kMATRIX_MULTIPLY &&
++                          name.find("/attn/MatMul_1") != std::string::npos);
++        if (!pin) continue;
++        layer->setPrecision(nvinfer1::DataType::kFLOAT);
++        for (int32_t output = 0; output < layer->getNbOutputs(); ++output) {
++          layer->setOutputType(output, nvinfer1::DataType::kFLOAT);
++        }
++        ++pinned;
++      }
++      builder_config->setFlag(nvinfer1::BuilderFlag::kOBEY_PRECISION_CONSTRAINTS);
++      std::cerr << "engine_builder: pinned " << pinned << " attention/softmax/norm layers to FP32\n";
++    }
++#pragma GCC diagnostic pop
++    // TensorRT builder workspace is a device-side sizing knob, separate from the
++    // W8A8 autotuner's per-candidate workspace limit. With 1 GiB the ground_c16
++    // Myelin subgraph has no admissible implementation on SM87/TensorRT 10.16.
+     builder_config->setMemoryPoolLimit(
+         nvinfer1::MemoryPoolType::kWORKSPACE,
+-        static_cast<size_t>(target.autotune_workspace_mib) * 1024U * 1024U);
++        static_cast<size_t>(target.engine_workspace_mib) * 1024U * 1024U);
+ 
+     std::vector<char> const timing_data = read_binary(arguments.timing_cache, true);
+     void const* const timing_pointer = timing_data.empty() ? nullptr : timing_data.data();
+--- a/src/trt_plugin.cpp
++++ b/src/trt_plugin.cpp
+@@ -350,7 +350,21 @@
+   PluginFieldCollection collection_{};
+ };
+ 
+-REGISTER_TENSORRT_PLUGIN(W8A8LinearCreator);
++// REGISTER_TENSORRT_PLUGIN registers under the empty registry namespace, but this
++// plugin's declared identity (target.toml, engine_builder, the ONNX plugin_namespace
++// attribute) is "latticeq". Register explicitly under kPluginNamespace so that
++// getCreator(kPluginName, kPluginVersion, kPluginNamespace) resolves.
++class W8A8LinearRegistrar {
++ public:
++  W8A8LinearRegistrar() noexcept {
++    ::getPluginRegistry()->registerCreator(creator_, kPluginNamespace);
++  }
++
++ private:
++  W8A8LinearCreator creator_;
++};
++
++W8A8LinearRegistrar const w8a8_linear_registrar{};
+ 
+ }  // namespace
+ }  // namespace latticeq::orin
+--- a/tests/native_registry_test.cpp
++++ b/tests/native_registry_test.cpp
+@@ -22,7 +22,7 @@
+     dlclose(handle);
+     return 3;
+   }
+-  auto* const creator = nvinfer1::getPluginRegistry()->getCreator(
++  auto* const creator = ::getPluginRegistry()->getCreator(
+       "LatticeQW8A8Linear", "1", "latticeq");
+   if (creator == nullptr) {
+     std::cerr << "TensorRT V3 creator is not registered\n";
+--- a/target.toml
++++ b/target.toml
+@@ -23,6 +23,11 @@
+ measurement_iterations = 100
+ workspace_mib = 1024
+ 
++[engine]
++# TensorRT builder workspace pool (MiB). Device sizing only; the 64 GB AGX Orin
++# shares this with activations/weights. 1024 was insufficient for ground_c16.
++workspace_mib = 8192
++
+ [benchmark]
+ warmup_iterations = 20
+ measurement_iterations = 100
+--- a/HANDOFF_STATUS.md
++++ b/HANDOFF_STATUS.md
+@@ -95,3 +95,36 @@
+ on Orin. Physical repacking, TensorRT tactic selection, workspace sizing, and
+ thermal/power measurements are device work; any numerical-policy change is a
+ new model candidate and must return through the frozen quality evaluation.
++
++## Addendum 2026-08-26 (on-target results, AGX Orin 64 GB / JetPack 7.2 / TensorRT 10.16.2)
++
++Two TensorRT 10.16 correctness problems affect `vision_1008.onnx` on this target and are handled by the updated
++`engine_builder` / `run_orin.sh`:
++
++1. TensorRT miscompiles the fused qkv-split/RoPE region of every trunk block **in every precision** (FP32 engine
++   cosine 0.57, FP16 cosine 0.07 against the PyTorch reference statistics recorded in
++   `assets/vision_1008.validation.json`; onnxruntime FP32 reproduces them to 4 decimals). `engine_builder
++   --break-fusion` inserts `Add(x, 0)` after each block's attention V tensor, which makes TensorRT FP32 match the
++   reference (rel-L2 0.002). The original FP16 vision plan built by this package (242 ms) is therefore numerically
++   wrong and must not be used as a baseline.
++2. Plain FP16 attention@V is numerically wrong (DART's documented failure). `--fp32-attention` pins attention@V,
++   Softmax and LayerNorm to FP32 (correct, rel-L2 0.049 vs FP32, ~466 ms).
++
++W8A8 result: `assets/vision_1008_int8.onnx` is a TensorRT-native explicit-Q/DQ INT8 graph (GPTQ + SmoothQuant
++weights, static per-tensor activations, block 0 kept FP16, activation Q/DQ on every block's proj input which also
++selects a correct FP16 MHA kernel). Built with `--precision int8 --break-fusion` (`run_orin.sh` default,
++`LQ_VISION_MODE=int8`). Measured against the FP32 (fixed) engine on 24 COCO images through text_c16/ground_c16:
++114/115 detections, identical-or-better COCO recall@0.5/0.75, GT mean box IoU 0.815 vs 0.817, no absent-prompt
++false positives; ~220–235 ms per 1008×1008 frame vs 466 ms for the fastest correct FP16 engine and 1055 ms FP32.
++The frozen "dynamic group-64 A8 plugin" candidate remains unimplemented; its onnxruntime-simulated quality ceiling
++is no better than the shipped static-INT8 recipe. Full details: `results/w8a8_20260826/README.md` in the project.
++
++### Update (2026-08-26, later): HuggingFace/DART export as the vision base
++
++`assets/vision_1008_hf.onnx` (+ `.data`) is the DART `export_hf_backbone.py` export of the same weights
++(bit-identical parameters; explicit Q·Kᵀ, real-valued RoPE, opset 20). On this TensorRT it is correct in plain FP16
++with no fusion breaker and no FP32 pinning (rel-L2 0.050 vs FP32, ~275 ms), so it replaces the Meta graph as the
++recommended base. `assets/vision_1008_hf_int8.onnx` carries the same INT8 recipe (~229 ms, detection-level parity
++with FP32). `run_orin.sh` routes: `LQ_VISION_MODE=hfint8` (default) | `hf16` | `int8` | `fp16`.
++Grounding class buckets `ground_c{1,4,8}.onnx` (exported with the handoff exporter, K guard lifted) run at
++23.9 / 95.2 / 190.1 ms vs 376 ms for the resident K=16 bucket.

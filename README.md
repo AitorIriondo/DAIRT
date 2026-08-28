@@ -7,8 +7,13 @@ at **15.8 FPS** (4 classes, 1008px) on a single RTX 4080.
 Distilled student backbones and pre-built weights are available on
 [HuggingFace](https://huggingface.co/mehmetkeremturkcan/DART).
 
+## News
+
+**DARTF is now available.** [Detect Anything in Real Time Faster](dartf/) runs the SAM3 ViT-H backbone in W8A8 INT8 on a Jetson AGX Orin **43% faster than DART's FP16 engine (275 ms → 158 ms per 1008 px frame, 1.74× throughput)** at FP32-level detection quality (COCO val2017: 56.0 AP vs 56.1 for FP32; 7.7 J per frame vs 13.2), with exact graph rewrites, activation-aware GPTQ and custom TensorRT plugins. See [dartf/README.md](dartf/README.md).
+
 ## Table of Contents
 
+- [DARTF: Detect Anything in Real Time Faster](dartf/)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Single-Image Detection](#single-image-detection)
