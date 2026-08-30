@@ -51,7 +51,7 @@ class Runner:
             buf.upload(x)
         ok = self.ctx.execute_v2([self.bufs[n][0].ptr for n in self.names]); assert ok
         out = {}
-        for n in (want or self.outputs):
+        for n in (self.outputs if want is None else want):
             rn = self._res(n); buf, shape, dt = self.bufs[rn]; out[n] = buf.download(shape, dt)
             if rn != n: out[rn] = out[n]
         return out

@@ -12,6 +12,7 @@ HR = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HR); sys.pat
 import tensorrt as trt
 from scipy.optimize import linear_sum_assignment
 from trt_util import load_engine, Runner, TRT_LOGGER, NP_DTYPE
+NP_DTYPE = dict(NP_DTYPE); NP_DTYPE[trt.int64] = np.int64
 from cuda_alloc import DevBuf, Stream, Event, PinnedBuf, memcpy_async, H2D
 import threading, queue
 from tokenize_classes import Sam3Tokenizer, CONTEXT_LENGTH, BUCKET
@@ -42,15 +43,18 @@ if not HAVE_TORCH:
             import cv2; a = np.asarray(x)[0, 0]; return cv2.resize(a, (size[1], size[0]), interpolation=cv2.INTER_LINEAR)[None, None]
 ap = argparse.ArgumentParser(); ap.add_argument("video"); ap.add_argument("out"); ap.add_argument("prompts"); ap.add_argument("--assets", default="assets")
 ap.add_argument("--vision", default="vision_int8.plan"); ap.add_argument("--ground", default="ground_c4m_fp16.plan"); ap.add_argument("--mask", default="maskhead_q32_phase_fp16.plan")
+ap.add_argument("--groundmask", default=None, help="fused grounding + segmentation engine (groundmask_cK_q32_phase_fp16.plan): replaces --ground and --mask; fpn_0/1/2 stay on the device, top-32 query selection happens in the graph")
 ap.add_argument("--text-onnx", default="text_c16.onnx"); ap.add_argument("--img-pos", default="img_pos_c4.npy"); ap.add_argument("--bpe", default="bpe_simple_vocab_16e6.txt.gz")
 ap.add_argument("--font-dir", default="/usr/share/fonts/truetype/lato"); ap.add_argument("--title", default="DARTF: Detect Anything in Real Time Faster"); ap.add_argument("--name", default=""); ap.add_argument("--affiliation", default="")
 ap.add_argument("--max-frames", type=int, default=0); ap.add_argument("--thr", type=float, default=0.5, help="score to start a track"); ap.add_argument("--low", type=float, default=0.25, help="score to continue a track")
 ap.add_argument("--nms", type=float, default=0.6); ap.add_argument("--app-w", type=float, default=0.3, help="weight of query-embedding cosine similarity in the association (0 = geometry only)"); ap.add_argument("--motion", type=int, default=1, help="constant velocity box prediction for association"); ap.add_argument("--fps-out", type=int, default=30); ap.add_argument("--gpu-name", default="RTX 4090")
-ap.add_argument("--tracker", choices=["none", "light", "sam3"], default="light", help="none: per-frame detections only; light: lightweight tracker (mask IoU + motion + query embeddings); sam3: light plus SAM 3 native propagation for tracks the detector misses (needs the trk_* engines and a vision engine exposing permute_4)")
+ap.add_argument("--tracker", choices=["none", "light", "sam3", "hybrid"], default="light", help="none: per-frame detections only; light: lightweight tracker (mask IoU + motion + query embeddings); sam3: light plus SAM 3 native propagation for tracks the detector misses (needs the trk_* engines and a vision engine exposing permute_4)")
 ap.add_argument("--heads", choices=["masks", "boxes"], default="masks", help="boxes: skip the segmentation head (boxes only, a few ms per frame less)")
-ap.add_argument("--sam3-tracker", action="store_true", help="same as --tracker sam3"); ap.add_argument("--sam3-np", action="store_true", help="torch-free SAM 3 driver (raw CUDA buffers + lq_util kernels); automatic when torch is absent"); ap.add_argument("--util-so", default=None, help="lq_util shared library (default: next to LQ_PLUGINS)"); ap.add_argument("--trk-dir", default=f"{HR}/exp/trk"); ap.add_argument("--vision-trunk", default=f"{HR}/exp/b0a8/vision_b0a8_trunk_sm89.plan")
-ap.add_argument("--refresh", type=int, default=6, help="frames between SAM 3 conditioning refreshes of a seen track"); ap.add_argument("--max-miss", type=int, default=8, help="longest gap the SAM 3 propagation bridges")
-ap.add_argument("--sam3-budget", type=int, default=4, help="max objects propagated per frame"); ap.add_argument("--sam3-v1", action="store_true", help="use the first-generation trk_step engine instead of trk_step_v2 (gathered keys, default when the v2 plan exists)"); ap.add_argument("--sam3-prune", type=int, default=4, help="v2: keep memory keys within this dilation (72-grid cells) of the object mask plus a background grid; 0 = all keys"); ap.add_argument("--sam3-adaptive", action="store_true", help="3 memory frames for stable objects, 7 otherwise"); ap.add_argument("--sam3-mem", type=int, default=7, help="max memory frames per step (conditioning + recent)"); ap.add_argument("--sam3-min-hits", type=int, default=8); ap.add_argument("--sam3-min-iou", type=float, default=0.6, help="stop propagating a track once the predicted mask IoU falls below this")
+ap.add_argument("--sam3-tracker", action="store_true", help="same as --tracker hybrid"); ap.add_argument("--sam3-assoc", type=float, default=0.5, help="sam3 tracker: mask IoU for matching a detection to a propagated object (SAM3 assoc_iou_thresh)"); ap.add_argument("--sam3-np", action="store_true", help="torch-free SAM 3 driver (raw CUDA buffers + lq_util kernels); automatic when torch is absent"); ap.add_argument("--util-so", default=None, help="lq_util shared library (default: next to LQ_PLUGINS)"); ap.add_argument("--trk-dir", default=f"{HR}/exp/trk"); ap.add_argument("--vision-trunk", default=f"{HR}/exp/b0a8/vision_b0a8_trunk_sm89.plan")
+ap.add_argument("--refresh", type=int, default=6, help="frames between SAM 3 conditioning refreshes of a seen track")
+ap.add_argument("--refresh-max", type=int, default=24, help="optional change-gated refresh (off by default): with --refresh-iou below 1, a memory is refreshed only when the detector mask moved (IoU below --refresh-iou vs the last refresh), and at least every --refresh-max frames"); ap.add_argument("--refresh-iou", type=float, default=1.0, help="1 (default) = fixed cadence of --refresh; below 1 enables the change gate"); ap.add_argument("--max-miss", type=int, default=8, help="longest gap the SAM 3 propagation bridges")
+ap.add_argument("--sam3-budget", type=int, default=4, help="max objects propagated per frame"); ap.add_argument("--sam3-v1", action="store_true", help="use the first-generation trk_step engine instead of trk_step_v2 (gathered keys, default when the v2 plan exists)"); ap.add_argument("--sam3-prune", type=int, default=4, help="v2: keep memory keys within this dilation (72-grid cells) of the object mask plus a background grid; 0 = all keys"); ap.add_argument("--sam3-adaptive", action="store_true", help="3 memory frames for stable objects, 7 otherwise"); ap.add_argument("--sam3-mem", type=int, default=7, help="max memory frames per step (conditioning + recent)"); ap.add_argument("--sam3-min-hits", type=int, default=None, help="track confirmation: consecutive matched detections before a track is shown (default 3 for --tracker sam3, SAM3's masklet confirmation; 8 for hybrid)"); ap.add_argument("--sam3-min-iou", type=float, default=0.0, help="stop propagating a track once the predicted mask IoU falls below this")
+ap.add_argument("--sam3-qprune", type=int, default=0, help="optional query-side pruning (off by default, changes the step): with trk_step_v3, only queries within this many cells of the object mask get the memory update"); ap.add_argument("--sam3-qgrid", type=int, default=0, help="v3 engines: background query grid stride (0 = none)"); ap.add_argument("--sam3-qfull", type=int, default=0, help="v3 engines: run a full (all-query) step every this many steps per object; its object score is carried through the pruned steps (0 = never)")
 ap.add_argument("--stats", default=None); ap.add_argument("--snap", default=None); ap.add_argument("--mot-out", default=None, help="write MOT-format tracks (frame,id,x,y,w,h,conf,-1,-1,-1) at the source resolution; with --no-render no video is written")
 ap.add_argument("--no-render", action="store_true"); ap.add_argument("--pipeline", action="store_true", help="two-stream frame pipeline: decode/preprocess in a thread, the backbone of frame t+1 runs on its own CUDA stream while the head, tracker and renderer process frame t"); ap.add_argument("--mot-box", choices=["det", "mask"], default="det", help="box written to --mot-out: the detector box (smoothed) or the mask extent"); ap.add_argument("--src-size", default=None, help="WxH of the source frames (image sequences)"); ap.add_argument("--fps-in", type=float, default=None, help="frame rate of an image-sequence input"); ap.add_argument("--no-lower-third", action="store_true"); ap.add_argument("--lt-slide", action="store_true", help="slide the lower third in (first clip); otherwise it fades in")
 ap.add_argument("--duration", type=float, default=15.0, help="seconds of source video to process"); ap.add_argument("--no-swipe", action="store_true", help="disable the with/without wipe")
@@ -60,8 +64,10 @@ for k in ("vision", "ground", "mask", "text_onnx", "img_pos", "bpe"):
     if not os.path.isabs(getattr(a, k)): setattr(a, k, os.path.join(a.assets, getattr(a, k)))
 a.trk_dir = a.trk_dir or a.assets; a.vision_trunk = a.vision_trunk or a.vision
 if a.sam3_tracker: a.tracker = "sam3"
-a.sam3_tracker = a.tracker == "sam3"
-if a.heads == "boxes" and a.tracker == "sam3": raise SystemExit("--tracker sam3 needs masks (it is initialized from the detector masks); use --heads masks")
+if a.sam3_tracker: a.tracker = "hybrid"
+a.sam3_tracker = a.tracker in ("sam3", "hybrid")
+if a.sam3_min_hits is None: a.sam3_min_hits = 3 if a.tracker == "sam3" else 8
+if a.heads == "boxes" and a.sam3_tracker: raise SystemExit("--tracker sam3/hybrid needs masks (it is initialized from the detector masks); use --heads masks")
 OW, OH = 1920, 1080; QSEL = 32
 PAL = [(0, 200, 255), (255, 196, 0), (0, 230, 118), (255, 82, 82), (171, 71, 188), (255, 145, 0), (29, 233, 182), (236, 64, 122)]
 def F(name, size):
@@ -82,7 +88,9 @@ tfK = np.ascontiguousarray(tf[:, :K, :]).astype(np.float16); tmK = np.ascontiguo
 
 # ---- engines ----
 if a.sam3_tracker: a.vision = a.vision_trunk
-vision = Runner(load_engine(a.vision)); ground = Runner(load_engine(a.ground)); img_pos = np.load(a.img_pos); KB = int(ground.bufs["img_feat"][1][0])   # prompt bucket of the head engine
+vision = Runner(load_engine(a.vision)); img_pos = np.load(a.img_pos)
+if a.groundmask: ground = None; fused_eng = load_engine(a.groundmask); KB = int(fused_eng.get_tensor_shape("text_feats")[1]); assert a.heads == "masks", "--groundmask computes masks"
+else: ground = Runner(load_engine(a.ground)); KB = int(ground.bufs["img_feat"][1][0])   # prompt bucket of the head engine
 assert K <= KB, f"{K} prompts but the head bucket is {KB}"; assert img_pos.shape[0] == KB, "img_pos does not match the head bucket"
 tf4 = np.ascontiguousarray(tf[:, :KB, :]).astype(np.float16); tm4 = np.ascontiguousarray(tm[:KB]).astype(np.float32)
 for i in range(K, KB): tm4[i, :] = tm[BUCKET - 1]; tf4[:, i, :] = tf[:, BUCKET - 1, :]                 # padded rows: empty prompt
@@ -106,7 +114,9 @@ class DynRunner:
         return {n: self.bufs[n][0].download(tuple(self.ctx.get_tensor_shape(n)), self.bufs[n][1]) for n in self.outputs}
 mask = None
 if a.heads == "masks":
-    mask = DynRunner(load_engine(a.mask)); mask.bind("fpn_0", vision.bufs[fpn0_name][0].ptr, tuple(vision.bufs[fpn0_name][1])); mask.bind("fpn_1", vision.bufs[fpn1_name][0].ptr, tuple(vision.bufs[fpn1_name][1]))
+    if a.groundmask: fused = DynRunner(fused_eng)
+    mask = fused if a.groundmask else DynRunner(load_engine(a.mask)); mask.bind("fpn_0", vision.bufs[fpn0_name][0].ptr, tuple(vision.bufs[fpn0_name][1])); mask.bind("fpn_1", vision.bufs[fpn1_name][0].ptr, tuple(vision.bufs[fpn1_name][1]))
+    if a.groundmask: mask.bind("fpn_2", vision.bufs["fpn_2"][0].ptr, tuple(vision.bufs["fpn_2"][1]))
 
 # ---- tracker: mask IoU Hungarian matching, low score continuation, coasting, EMA smoothing, class voting ----
 dev = torch.device("cuda")
@@ -159,8 +169,50 @@ if a.sam3_tracker and not SAM3_NP:
 elif SAM3_NP:
     from sam3_track_np import Sam3TrackerNP
     util = a.util_so or os.path.join(os.path.dirname(os.environ.get("LQ_PLUGINS", "")), "lq_util.so")
-    trk = Sam3TrackerNP(f"{a.trk_dir}/trk_neck_fp16.plan", f"{a.trk_dir}/trk_init288_fp16.plan", f"{a.trk_dir}/trk_step_v2_fp16.plan", vision.bufs["permute_4"][0].ptr, vision.bufs["permute_4"][1], np.load(f"{a.trk_dir}/pe_mem.npy"), np.load(f"{a.trk_dir}/tpos_enc.npy"), util, prune_r=a.sam3_prune)
+    step_plan = f"{a.trk_dir}/trk_step_v3_fp16.plan" if (a.sam3_qprune > 0 and os.path.exists(f"{a.trk_dir}/trk_step_v3_fp16.plan")) else f"{a.trk_dir}/trk_step_v2_fp16.plan"; print("SAM 3 step engine:", os.path.basename(step_plan))
+    trk = Sam3TrackerNP(f"{a.trk_dir}/trk_neck_fp16.plan", f"{a.trk_dir}/trk_init288_fp16.plan", step_plan, vision.bufs["permute_4"][0].ptr, vision.bufs["permute_4"][1], np.load(f"{a.trk_dir}/pe_mem.npy"), np.load(f"{a.trk_dir}/tpos_enc.npy"), util, prune_r=a.sam3_prune, qprune_r=a.sam3_qprune, qgrid_stride=a.sam3_qgrid, qfull_every=a.sam3_qfull)
     trk.m_max = min(trk.m_max, a.sam3_mem); trk.adaptive = a.sam3_adaptive
+NATIVE = {}
+def sam3_native_frame(fi, dets):
+    """SAM3-native tracking: every object is propagated by the memory attention each frame and the masks come from the tracker.
+    Detections only associate (mask IoU >= --sam3-assoc), refresh the conditioning memory every --refresh frames, and spawn new objects;
+    presence follows SAM3's rule (object score > 0); an object unmatched by any detection for --max-miss frames is removed."""
+    trk.run_neck(); high = [d for d in dets if d["p"] >= a.thr and d["mask"] is not None]
+    ids = sorted(NATIVE)
+    if ids:
+        res = trk.propagate(fi, ids)
+        for oid in ids:
+            t = NATIVE[oid]
+            if oid in res:
+                m, sc, iou = res[oid]; t.mask = torch.as_tensor(m, device=dev) if HAVE_TORCH else m; t.p = float(1 / (1 + np.exp(-sc)))
+                bx = mask_box(t); t.box = np.array(bx, np.float64)
+    pairs, un_t, un_d = ([], list(range(len(ids))), list(range(len(high)))) if not (ids and high) else (lambda M: (lambda r, c: ([(i, j) for i, j in zip(r, c) if M[i, j] >= a.sam3_assoc], [i for i in range(len(ids)) if i not in set(r[M[r, c] >= a.sam3_assoc])], [j for j in range(len(high)) if j not in set(c[M[r, c] >= a.sam3_assoc])]))(*linear_sum_assignment(1 - M)))(iou_matrix([NATIVE[i].mask for i in ids], [d["mask"] for d in high]))
+    for i, j in pairs:
+        t = NATIVE[ids[i]]; d = high[j]; t.votes[d["k"]] += d["p"]; t.hits += 1; t.misses = 0
+        if fi - trk.obj(t.id).last_init >= a.refresh:
+            if SAM3_NP and d.get("row_ptr") is not None: trk.refresh(fi, [t.id], [d["row_ptr"]])
+            elif not SAM3_NP: trk.refresh(fi, [t.id], torch.stack([Fn.interpolate(torch.as_tensor(d["mask"], device=dev)[None, None], size=(1008, 1008), mode="bilinear", align_corners=False)[0, 0] > 0]))
+    for i in un_t:
+        t = NATIVE[ids[i]]; t.misses += 1
+        if t.misses > a.max_miss: trk.drop(t.id); del NATIVE[t.id]
+    for j in un_d:
+        d = high[j]
+        if SAM3_NP and d.get("row_ptr") is None: continue
+        t = Track(tracker.next_id, d); tracker.next_id += 1; NATIVE[t.id] = t
+        if SAM3_NP: trk.refresh(fi, [t.id], [d["row_ptr"]])
+        else: trk.refresh(fi, [t.id], torch.stack([Fn.interpolate(torch.as_tensor(d["mask"], device=dev)[None, None], size=(1008, 1008), mode="bilinear", align_corners=False)[0, 0] > 0]))
+    trk.prune(list(NATIVE))
+    return [t for t in NATIVE.values() if t.hits >= a.sam3_min_hits and t.p > 0.5 and t.mask is not None]
+REF_MASK = {}
+def mask72(t):
+    m = t.mask[::4, ::4] > 0; return m.cpu().numpy() if HAVE_TORCH else np.asarray(m)
+def refresh_due(t, fi):
+    """change-gated refresh: at least --refresh frames apart, always by --refresh-max frames, and in between only when the detector mask moved
+    (IoU with the mask at the last refresh below --refresh-iou); --refresh-iou 1 restores a fixed cadence"""
+    age = fi - trk.obj(t.id).last_init
+    if age < a.refresh: return False
+    if age >= a.refresh_max or t.id not in REF_MASK or a.refresh_iou >= 1.0: return True
+    cur = mask72(t); ref = REF_MASK[t.id]; union = int((cur | ref).sum()); return union == 0 or int((cur & ref).sum()) / union < a.refresh_iou
 def sam3_frame(fi, dets):
     """hybrid: the lightweight tracker associates detections; SAM 3 memories are refreshed from detector masks every --refresh frames for tracks
     the detector sees, and SAM 3 propagation runs only for confirmed tracks the detector missed this frame (their mask and box follow the propagation)"""
@@ -168,7 +220,8 @@ def sam3_frame(fi, dets):
     seen = [t for t in tracker.tracks if t.misses == 0 and t.hits >= a.sam3_min_hits]
     lost = [t for t in tracker.tracks if 0 < t.misses <= a.max_miss and t.hits >= a.sam3_min_hits and not trk.dropped(t.id)]
     lost.sort(key=lambda t: (t.misses, -t.hits)); lost = lost[:a.sam3_budget]                     # budget: the most recently lost, longest-lived tracks first
-    due = [t for t in seen if fi - trk.obj(t.id).last_init >= a.refresh and (not SAM3_NP or getattr(t, "det_row", None) is not None)]
+    due = [t for t in seen if refresh_due(t, fi) and (not SAM3_NP or getattr(t, "det_row", None) is not None)]
+    for t in due: REF_MASK[t.id] = mask72(t)
     if due and SAM3_NP: trk.refresh(fi, [t.id for t in due], [t.det_row for t in due])
     elif due:
         m1008 = torch.stack([Fn.interpolate(torch.as_tensor(t.mask, device=dev)[None, None], size=(1008, 1008), mode="bilinear", align_corners=False)[0, 0] > 0 for t in due])   # stays on the GPU
@@ -179,8 +232,10 @@ def sam3_frame(fi, dets):
             if t.id in res and res[t.id][1] > 0 and res[t.id][2] >= a.sam3_min_iou:   # SAM 3 still sees the object with a confident mask: carry it, keep the track visible
                 m, sc, iou = res[t.id]; t.mask = torch.as_tensor(m, device=dev); t.p = max(t.p, 0.45); t.misses = min(t.misses, 1)
                 if t not in shown: shown.append(t)
-            elif t.id in res: trk.drop(t.id)                                            # the tracker lost it too: stop spending steps on it
-    trk.prune(live); return shown
+            elif t.id in res: trk.drop(t.id); stats["sam3_drops"] = stats.get("sam3_drops", 0) + 1     # the tracker lost it too: stop spending steps on it
+    trk.prune(live)
+    for k in [k for k in REF_MASK if k not in live]: del REF_MASK[k]
+    return shown
 
 # ---- overlays ----
 def rounded_box(img, x0, y0, x1, y1, color, t=3, r=14):
@@ -203,7 +258,7 @@ def ease(x): x = max(0.0, min(1.0, x)); return x * x * (3 - 2 * x)
 if a.fps_in: src_fps = a.fps_in; n_frames = 0
 else:
     probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=r_frame_rate,nb_frames", "-of", "csv=p=0", a.video], capture_output=True, text=True).stdout.strip().split(",")
-    num, den = probe[0].split("/"); src_fps = float(num) / float(den); n_frames = int(probe[1]) if probe[1].isdigit() else 0
+    num, den = (probe[0].split("/") + ["1"])[:2] if probe and "/" in probe[0] else ("1", "1"); src_fps = float(num) / max(1e-6, float(den)); n_frames = int(probe[1]) if len(probe) > 1 and probe[1].isdigit() else 0
 if a.src_size: SW, SH = [int(v) for v in a.src_size.lower().split("x")]
 else:
     pr = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "csv=p=0", a.video], capture_output=True, text=True).stdout.strip().split(","); SW, SH = int(pr[0]), int(pr[1])
@@ -216,10 +271,30 @@ class SeqReader:
         if not os.path.exists(path): return b""
         self.i += 1; im = Image.open(path).convert("RGB").resize((1008, 1008), Image.BILINEAR); return np.asarray(im, dtype=np.uint8).tobytes()
     def kill(self): pass
+IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+is_image = a.video.lower().endswith(IMG_EXT) and "%" not in a.video
+if is_image: a.max_frames = 1; a.tracker = "none"; a.no_swipe = True               # one frame: raw detections, full overlay, no identities to build
 is_seq = "%" in a.video and a.no_render
-dec_m = SeqReader(a.video) if is_seq else subprocess.Popen(["ffmpeg", "-v", "error", "-i", a.video, "-vf", "scale=1008:1008:flags=bilinear", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE, bufsize=10 ** 8)
-dec_d = None if a.no_render else subprocess.Popen(["ffmpeg", "-v", "error", "-i", a.video, "-vf", f"scale={OW}:{OH}:flags=bicubic", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE, bufsize=10 ** 8)
-enc = None if a.no_render else subprocess.Popen(["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{OW}x{OH}", "-framerate", f"{src_fps:.6f}", "-i", "-", "-r", str(a.fps_out), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "19", "-preset", "medium", a.out], stdin=subprocess.PIPE)
+class ImageReader:
+    """single image: one 1008x1008 frame for the model, the original resolution for the output"""
+    def __init__(self, path):
+        im = Image.open(path).convert("RGB"); self.orig = im; self.done = False
+        self.model = np.asarray(im.resize((1008, 1008), Image.BILINEAR)).tobytes()
+    class _P:
+        def __init__(self, b): self.b = b
+        def read(self, n): r = self.b[:n]; self.b = self.b[n:]; return r
+    @property
+    def stdout(self): return self._out
+    def kill(self): pass
+if is_image:
+    _ir = ImageReader(a.video); dec_m = _ir; dec_m._out = ImageReader._P(_ir.model)
+    OW, OH = (_ir.orig.width // 2) * 2, (_ir.orig.height // 2) * 2; src_fps = 1.0; n_frames = 1
+else: dec_m = SeqReader(a.video) if is_seq else subprocess.Popen(["ffmpeg", "-v", "error", "-i", a.video, "-vf", "scale=1008:1008:flags=bilinear", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE, bufsize=10 ** 8)
+if is_image:
+    dec_d = ImageReader._P(np.asarray(_ir.orig.resize((OW, OH), Image.BILINEAR)).tobytes()) if not a.no_render else None; dec_d = type("D", (), {"stdout": dec_d, "kill": lambda self: None})() if dec_d else None
+    enc = None
+else: dec_d = None if a.no_render else subprocess.Popen(["ffmpeg", "-v", "error", "-i", a.video, "-vf", f"scale={OW}:{OH}:flags=bicubic", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE, bufsize=10 ** 8)
+enc = None if (a.no_render or is_image) else subprocess.Popen(["ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{OW}x{OH}", "-framerate", f"{src_fps:.6f}", "-i", "-", "-r", str(a.fps_out), "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "19", "-preset", "medium", a.out], stdin=subprocess.PIPE)
 class PipelinedVision:
     """the vision engine on a non-blocking stream with double-buffered inputs/outputs: enqueue(t+1) is issued before frame t is consumed"""
     def __init__(self, runner):
@@ -243,7 +318,7 @@ PV = PipelinedVision(vision) if a.pipeline else None
 if a.pipeline: fq = queue.Queue(maxsize=3); threading.Thread(target=reader, args=(fq,), daemon=True).start(); nxt = fq.get()
 stats = {"frames": 0, "vision_ms": [], "head_ms": [], "mask_ms": [], "tracks": [], "new_ids": [], "appear": []}; prev_shown = set()
 XG = np.arange(OW)[None, :, None]
-src_dur = 0.0 if (a.no_render or a.fps_in) else float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", a.video], capture_output=True, text=True).stdout.strip() or 0)
+src_dur = 0.0 if (a.no_render or a.fps_in or is_image) else float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", a.video], capture_output=True, text=True).stdout.strip() or 0)
 clip_len = min(a.duration, src_dur) if a.duration else src_dur; cycle = clip_len >= 13.0      # the off/on cycle needs 4 s and must finish 2 s before the cut
 T_OFF, T_ON = clip_len - 6.0, clip_len - 4.0
 def mask_box(t):
@@ -267,22 +342,23 @@ while True:
         if fi == 0: PV.enqueue(0, x[None])
         t0 = time.perf_counter(); nxt = fq.get()
         if nxt is not None: PV.enqueue(fi + 1, nxt[0][None])                       # backbone of the next frame starts now, on its own stream
-        bufset = PV.wait(fi); v = {"fpn_2": bufset["fpn_2"].download(PV.shapes["fpn_2"], PV.dts["fpn_2"])}; t1 = time.perf_counter()
+        bufset = PV.wait(fi); v = {} if a.groundmask else {"fpn_2": bufset["fpn_2"].download(PV.shapes["fpn_2"], PV.dts["fpn_2"])}; t1 = time.perf_counter()
         if mask is not None: mask.bind("fpn_0", bufset[fpn0_name].ptr, PV.shapes[fpn0_name]); mask.bind("fpn_1", bufset[fpn1_name].ptr, PV.shapes[fpn1_name])
+        if a.groundmask: mask.bind("fpn_2", bufset["fpn_2"].ptr, PV.shapes["fpn_2"])
         if trk is not None: trk.neck.bind("trunk", bufset["permute_4"].ptr, PV.shapes["permute_4"])
     else:
         bm = dec_m.stdout.read(1008 * 1008 * 3); bd = dec_d.stdout.read(OW * OH * 3) if dec_d else b""
         if len(bm) < 1008 * 1008 * 3 or (dec_d and len(bd) < OW * OH * 3) or (a.max_frames and fi >= a.max_frames) or (a.duration and fi >= int(a.duration * src_fps)): break
         x = preprocess(bm)
-        t0 = time.perf_counter(); v = vision({"images": x[None]}, want=["fpn_2"]); DevBuf.sync(); t1 = time.perf_counter()
-    g = ground({"img_feat": np.repeat(v["fpn_2"].astype(np.float16), KB, axis=0), "img_pos": img_pos, "text_feats": tf4, "text_mask": tm4}); DevBuf.sync(); t2 = time.perf_counter()
+        t0 = time.perf_counter(); v = vision({"images": x[None]}, want=[] if a.groundmask else ["fpn_2"]); DevBuf.sync(); t1 = time.perf_counter()
+    g = fused({"text_feats": tf4, "text_mask": tm4}) if a.groundmask else ground({"img_feat": np.repeat(v["fpn_2"].astype(np.float16), KB, axis=0), "img_pos": img_pos, "text_feats": tf4, "text_mask": tm4}); DevBuf.sync(); t2 = time.perf_counter()
     probs = sigmoid(g["scores"][:K, :, 0]) * sigmoid(g["presence"][:K, 0])[:, None]
-    active = [k for k in range(K) if (probs[k] > a.low).any()]; sel = {k: np.argsort(-probs[k])[:QSEL] for k in active}; dets = []
+    active = [k for k in range(K) if (probs[k] > a.low).any()]; sel = {k: (g["sel"][k] if a.groundmask else np.argsort(-probs[k])[:QSEL]) for k in active}; dets = []
     if active:
-        cand = sorted([(float(probs[k, q]), k, q, ai, qi) for ai, k in enumerate(active) for qi, q in enumerate(sel[k]) if probs[k, q] > a.low], key=lambda c: -c[0])
+        cand = sorted([(float(probs[k, q]), k, q, (k if a.groundmask else ai), qi) for ai, k in enumerate(active) for qi, q in enumerate(sel[k]) if probs[k, q] > a.low], key=lambda c: -c[0])   # ai: row of the mask array (the prompt itself for the fused engine)
         if mask is not None:
-            hs_sel = np.stack([g["hs"][k, sel[k]] for k in active]).astype(np.float16)
-            m = mask({"enc": np.ascontiguousarray(g["enc"][:, active, :]), "text_feats": np.ascontiguousarray(tfK[:, active, :]), "text_mask": np.ascontiguousarray(tmK[active]), "hs_sel": hs_sel})["masks"]
+            if a.groundmask: m = g["masks"]
+            else: hs_sel = np.stack([g["hs"][k, sel[k]] for k in active]).astype(np.float16); m = mask({"enc": np.ascontiguousarray(g["enc"][:, active, :]), "text_feats": np.ascontiguousarray(tfK[:, active, :]), "text_mask": np.ascontiguousarray(tmK[active]), "hs_sel": hs_sel})["masks"]
             mt = torch.from_numpy(m.astype(np.float32)).to(dev) if HAVE_TORCH else m.astype(np.float32)
         if cand and mask is not None:
             if HAVE_TORCH:
@@ -318,7 +394,7 @@ while True:
     if a.tracker == "none":
         shown = [Track(i + 1, d) for i, d in enumerate(dets)]
         for t in shown: t.hits = 99
-    else: shown = sam3_frame(fi, dets) if trk else tracker.step(dets)
+    else: shown = ((sam3_native_frame(fi, dets) if a.tracker == "sam3" else sam3_frame(fi, dets)) if trk else tracker.step(dets))
     if mot_f is not None:
         for t in shown:
             x0, y0, x1, y1 = (mask_box(t) if (t.mask is not None and a.mot_box == "mask") else tuple(t.box)); mot_f.write(f"{fi + 1},{t.id},{x0 * SW / OW:.2f},{y0 * SH / OH:.2f},{(x1 - x0) * SW / OW:.2f},{(y1 - y0) * SH / OH:.2f},{t.p:.3f},-1,-1,-1\n")
@@ -363,7 +439,8 @@ while True:
             if e < 1: lt.putalpha(lt.getchannel("A").point(lambda v: int(v * e)))
             slide = int((1 - ease((tsec - a.lt_in) / 0.8)) * 60) if a.lt_slide else 0
             pil.paste(lt, (40 - slide, OH - LT.height - 40), lt)
-    out = np.asarray(pil.convert("RGB")); enc.stdin.write(out.tobytes())
+    if is_image: pil.convert("RGB").save(a.out)
+    else: out = np.asarray(pil.convert("RGB")); enc.stdin.write(out.tobytes())
     if a.snap and fi == int(a.snap): pil.convert("RGB").save(a.out + f".frame{fi}.png")
     stats["vision_ms"].append((t1 - t0) * 1000); stats["head_ms"].append((t2 - t1) * 1000); stats["mask_ms"].append((t3 - t2) * 1000); stats["tracks"].append(len(shown)); stats["frames"] += 1; fi += 1
     if fi % 50 == 0: print(f"{fi}/{n_frames}  backbone {np.mean(stats['vision_ms'][-50:]):.1f}  head {np.mean(stats['head_ms'][-50:]):.1f}  masks {np.mean(stats['mask_ms'][-50:]):.1f} ms  tracks {len(shown)}  {time.time() - t_start:.0f}s", flush=True)
@@ -371,5 +448,5 @@ if enc: enc.stdin.close(); enc.wait()
 dec_m.kill()
 if dec_d: dec_d.kill()
 if mot_f: mot_f.close()
-summary = {"video": a.video, "prompts": prompts, "tracker": a.tracker, "heads": a.heads, "pipeline": a.pipeline, "frames": stats["frames"], "wall_ms_per_frame": (time.time() - t_start) * 1000 / max(1, stats["frames"]), "backbone_ms": float(np.mean(stats["vision_ms"])), "head_ms": float(np.mean(stats["head_ms"])), "mask_ms": float(np.mean(stats["mask_ms"])), **({"sam3_tracker_ms_per_frame": {k: v / max(1, stats["frames"]) for k, v in trk.t_ms.items()}, "sam3_refreshes": trk.n_init, "sam3_steps": trk.n_step, "sam3_step_calls": trk.n_step_calls, **({"sam3_prof_ms_per_call": {k: v * 1000 / max(1, trk.n_step_calls) for k, v in trk.prof.items()}} if getattr(trk, "prof", None) else {}), "sam3_keys_fraction": trk.keys_used / max(1, trk.keys_full)} if trk else {}), "tracks_mean": float(np.mean(stats["tracks"])), "new_ids_per_frame_after_warmup": float(np.mean(stats["new_ids"][10:])) if len(stats["new_ids"]) > 10 else None, "tracks_appearing_per_frame": float(np.mean(stats["appear"][10:])) if len(stats["appear"]) > 10 else None, "src_fps": src_fps}
+summary = {"video": a.video, "prompts": prompts, "tracker": a.tracker, "heads": a.heads, "pipeline": a.pipeline, "frames": stats["frames"], "wall_ms_per_frame": (time.time() - t_start) * 1000 / max(1, stats["frames"]), "backbone_ms": float(np.mean(stats["vision_ms"])), "head_ms": float(np.mean(stats["head_ms"])), "mask_ms": float(np.mean(stats["mask_ms"])), **({"sam3_tracker_ms_per_frame": {k: v / max(1, stats["frames"]) for k, v in trk.t_ms.items()}, "sam3_refreshes": trk.n_init, "sam3_steps": trk.n_step, "sam3_step_calls": trk.n_step_calls, "sam3_drops": stats.get("sam3_drops", 0), **({"sam3_prof_ms_per_call": {k: v * 1000 / max(1, trk.n_step_calls) for k, v in trk.prof.items()}} if getattr(trk, "prof", None) else {}), "sam3_keys_fraction": trk.keys_used / max(1, trk.keys_full), "sam3_queries_fraction": (trk.q_used / max(1, trk.q_full)) if getattr(trk, "q_full", 0) else None} if trk else {}), "tracks_mean": float(np.mean(stats["tracks"])), "new_ids_per_frame_after_warmup": float(np.mean(stats["new_ids"][10:])) if len(stats["new_ids"]) > 10 else None, "tracks_appearing_per_frame": float(np.mean(stats["appear"][10:])) if len(stats["appear"]) > 10 else None, "src_fps": src_fps}
 print(json.dumps(summary)); json.dump(summary, open(a.stats or a.out + ".json", "w"), indent=1)

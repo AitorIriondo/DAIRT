@@ -42,11 +42,11 @@ class DynRunner:
             shp = tuple(self.ctx.get_tensor_shape(n)); out[n] = self.bufs[n][0].download(shp, self.bufs[n][2]) if download else (self.bufs[n][0].ptr, shp, self.bufs[n][2])
         return out
 class Obj:
-    __slots__ = ("id", "conds", "hist", "mask", "score", "iou", "last_init", "last_step")
-    def __init__(self, oid): self.id = oid; self.conds = {}; self.hist = {}; self.mask = None; self.score = 10.0; self.iou = 1.0; self.last_init = -999; self.last_step = -999
+    __slots__ = ("id", "conds", "hist", "mask", "score", "iou", "last_init", "last_step", "since_full", "full_score")
+    def __init__(self, oid): self.id = oid; self.conds = {}; self.hist = {}; self.mask = None; self.score = 10.0; self.iou = 1.0; self.last_init = -999; self.last_step = -999; self.since_full = 0; self.full_score = 10.0
 class Sam3TrackerNP:
     NM, MAXPTR, MF_THR, MAX_COND = 7, 16, 0.01, 4
-    def __init__(self, neck_plan, init288_plan, step_plan, vision_bufptr, vision_shape, pe_mem, tpos_enc, util_so, max_hist=24, prune_r=4, grid_stride=2):
+    def __init__(self, neck_plan, init288_plan, step_plan, vision_bufptr, vision_shape, pe_mem, tpos_enc, util_so, max_hist=24, prune_r=4, grid_stride=2, qprune_r=6, qgrid_stride=0, qfull_every=0):
         self.util = ctypes.CDLL(util_so); self.util.lq_gather_rows64.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]; self.util.lq_gather_blocks.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_size_t, ctypes.c_void_p]
         self.util.lq_transpose64.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
         self.neck = DynRunner(load_engine(neck_plan)); self.init = DynRunner(load_engine(init288_plan)); self.step = DynRunner(load_engine(step_plan)); self.max_hist = max_hist; self.prune_r = prune_r; self.adaptive = False
@@ -62,7 +62,8 @@ class Sam3TrackerNP:
         self.ptr_tab = DevBuf(8 * self.b_max * self.kn_max); self.nv_dev = DevBuf(4 * self.b_max); self.mask_gather = DevBuf(self.b_init * 288 * 288 * 2); self.mask_ptrs = DevBuf(8 * self.b_init)
         self.mem_t = DevBuf(max(self.b_max, self.b_init) * 64 * 5184 * 2)      # token-major transposed memories of one call
         pet = np.ascontiguousarray(np.stack([self.pe_flat + self.tpos_flat[tp] for tp in range(self.NM)]).astype(np.float16)); self.pet = DevBuf(pet.nbytes); self.pet.upload(pet)   # [NM, 5184, 64] fp16: key position rows, gathered on the device
-        self.pos_tab = DevBuf(8 * self.b_max * self.kn_max); self.pool = []; self.kn_bucket = int(os.environ.get("LQ_KN_BUCKET", 2048))       # free list of memory-frame buffers (no cudaMalloc per step)
+        self.pos_tab = DevBuf(8 * self.b_max * self.kn_max); self.pool = []; self.kn_bucket = int(os.environ.get("LQ_KN_BUCKET", 2048)); self.nq_bucket = int(os.environ.get("LQ_NQ_BUCKET", 512))
+        self.v3 = "qidx" in self.step.inputs; self.qprune_r = qprune_r; self.qfull_every = qfull_every; self.qbg = ((yy % qgrid_stride == 0) & (xx % qgrid_stride == 0)).ravel() if qgrid_stride > 0 else np.zeros(5184, bool); self.q_used = 0; self.q_full = 0       # free list of memory-frame buffers (no cudaMalloc per step)
         assert self.step.bufs["mempos"][2] == np.float16
     def _alloc(self): return self.pool.pop() if self.pool else DevBuf(64 * 5184 * 2)
     def _forget(self, d, keys):
@@ -91,6 +92,15 @@ class Sam3TrackerNP:
                 for dx in range(2 * r + 1): reg |= pad[dy:dy + 72, dx:dx + 72]
             keep = reg.ravel() | self.bg_keep
         return keep
+    def _qkeep(self, ob):
+        """queries that get the memory-attention update (v3 engines): the object's dilated mask (radius qprune_r) plus an optional background grid"""
+        if not self.v3 or self.qprune_r <= 0 or ob.mask is None or (self.qfull_every > 0 and ob.since_full >= self.qfull_every): return np.ones(5184, bool)   # periodic full step: owns the object score
+        m72 = (np.asarray(ob.mask) > 0).reshape(288, 288)[::4, ::4]; r = self.qprune_r; pad = np.pad(m72, r); reg = np.zeros_like(m72)
+        for dy in range(2 * r + 1):
+            for dx in range(2 * r + 1): reg |= pad[dy:dy + 72, dx:dx + 72]
+        keep = reg.ravel() | self.qbg
+        if not keep.any(): keep[:] = True
+        return keep
     def _bank(self, ob, t):
         conds = sorted(ob.conds, key=lambda f: abs(t - f))[:self.MAX_COND]
         valid = [f for f in sorted(ob.hist) if f < t and ob.hist[f][2] > self.MF_THR][-(self.MAXPTR - 1):]
@@ -118,13 +128,21 @@ class Sam3TrackerNP:
                 self.ptr_tab.upload(table); self.nv_dev.upload(nv); memtok_buf = self.step.bufs["memtok"][0]
                 assert self.util.lq_gather_rows64(memtok_buf.ptr, self.ptr_tab.ptr, self.nv_dev.ptr, Bc, Kn, None) == 0
                 self.pos_tab.upload(ptab); mempos_buf = self.step.bufs["mempos"][0]; assert self.util.lq_gather_rows64(mempos_buf.ptr, self.pos_tab.ptr, self.nv_dev.ptr, Bc, Kn, None) == 0
-                self.keys_used += int(nv.sum()); self.keys_full += int(M * 5184 * Bc)
+                self.keys_used += int(nv.sum()); self.keys_full += int(M * 5184 * Bc); extra = {}
+                if self.v3:
+                    qsels = [np.nonzero(self._qkeep(ob))[0] for (ob, *_r) in chunk]; nq = np.array([len(q) for q in qsels], np.int32); Nq = int(min(5184, -(-int(nq.max()) // self.nq_bucket) * self.nq_bucket))
+                    qidx = np.zeros((Bc, Nq), np.int64)
+                    for i, q in enumerate(qsels): qidx[i, :len(q)] = q; qidx[i, len(q):] = q[0]          # padding repeats a valid query (masked as a key, identical row)
+                    extra = {"qidx": qidx, "nq": nq}; self.q_used += int(nq.sum()); self.q_full += 5184 * Bc
                 if self.PROF: DevBuf.sync(); t2 = time.perf_counter(); self.prof["gather"] += t2 - t1
-                o = self.step({"memtok": ("ptr", memtok_buf.ptr, (Bc, Kn, 64)), "mempos": ("ptr", mempos_buf.ptr, (Bc, Kn, 64)), "keyidx": keyidx, "nvalid": nv, "ptrs": np.stack([it[3] for it in chunk]).astype(np.float32), "ptr_pos": chunk[0][4]}, want=["masks", "obj_ptr", "obj_score", "iou"])
+                o = self.step({"memtok": ("ptr", memtok_buf.ptr, (Bc, Kn, 64)), "mempos": ("ptr", mempos_buf.ptr, (Bc, Kn, 64)), "keyidx": keyidx, "nvalid": nv, "ptrs": np.stack([it[3] for it in chunk]).astype(np.float32), "ptr_pos": chunk[0][4], **extra}, want=["masks", "obj_ptr", "obj_score", "iou"])
                 if self.PROF: DevBuf.sync(); t3 = time.perf_counter(); self.prof["engine"] += t3 - t2
                 mm_ptr = self.step.bufs["maskmem"][0].ptr; assert self.util.lq_transpose64(self.mem_t.ptr, mm_ptr, Bc, int(self.step.bufs["maskmem"][2] == np.float32), None) == 0; DevBuf.sync(); self.t_ms["step"] += (time.perf_counter() - t0) * 1000; self.n_step_calls += 1; self.n_step += Bc
                 for i, (ob, *_r) in enumerate(chunk):
                     ob.mask = o["masks"][i, 0].astype(np.float32); ob.score = float(o["obj_score"][i, 0]); ob.iou = float(o["iou"][i, 0]); ob.last_step = t
+                    if self.v3 and self.qfull_every > 0:
+                        if int(nq[i]) >= 5184: ob.since_full = 0; ob.full_score = ob.score
+                        else: ob.since_full += 1; ob.score = ob.full_score                        # pruned steps carry the last full-step score (drop decisions happen on full steps)
                     buf = self._alloc(); memcpy_d2d(buf.ptr, self.mem_t.ptr + i * 64 * 5184 * 2, 64 * 5184 * 2); ob.hist[t] = (buf, o["obj_ptr"][i].astype(np.float32), self.mem_score(ob.score, ob.iou))
                     self._forget(ob.hist, sorted(ob.hist)[:-self.max_hist])
                     out[ob.id] = (ob.mask, ob.score, ob.iou)

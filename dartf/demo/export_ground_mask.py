@@ -5,7 +5,7 @@ import sys, os, json, time, argparse
 from pathlib import Path
 ap = argparse.ArgumentParser(); ap.add_argument("--dart", required=True, help="DART repository root (its sam3 package is imported)"); ap.add_argument("--ckpt", required=True, help="official sam3.pt")
 ap.add_argument("--out", required=True); ap.add_argument("--buckets", default="4,1", help="prompt buckets K to export"); ap.add_argument("--qsel", type=int, default=32, help="queries per prompt fed to the mask head")
-ap.add_argument("--threads", type=int, default=16); ap.add_argument("--phase-conv", action="store_true", help="exact rewrite of conv3x3(fpn + nearest_up2(x)) as conv3x3(fpn) once per image plus four 2x2 phase convolutions at half resolution"); ap.add_argument("--only-mask", action="store_true"); args = ap.parse_args()
+ap.add_argument("--threads", type=int, default=16); ap.add_argument("--fused", action="store_true", help="also export groundmask_cK: grounding head + in-graph top-Q query selection + segmentation head in one static graph (fpn_0/1/2 bound to the backbone buffers, img_pos baked in)"); ap.add_argument("--phase-conv", action="store_true", help="exact rewrite of conv3x3(fpn + nearest_up2(x)) as conv3x3(fpn) once per image plus four 2x2 phase convolutions at half resolution"); ap.add_argument("--only-mask", action="store_true"); args = ap.parse_args()
 DART = args.dart; CKPT = args.ckpt; OUT = Path(args.out); BUCKETS = [int(k) for k in args.buckets.split(",")]; QSEL = args.qsel
 sys.path.insert(0, DART)
 import torch
@@ -90,6 +90,21 @@ class MaskWrapper(torch.nn.Module):
                        encoder_hidden_states=enc, prompt=tf, prompt_mask=tm)
         return out["pred_masks"].to(torch.float16)
 
+class FusedWrapper(torch.nn.Module):
+    """fpn_0 [1,256,288,288], fpn_1 [1,256,144,144], fpn_2 [1,256,72,72] (fp32, bound to the backbone's buffers), text_feats [32,K,256] fp16, text_mask [K,32] fp32
+    -> scores [K,200,1], boxes [K,200,4], presence [K,1], hs [K,200,256] (fp16), sel [K,Q] int64 (top-Q queries per prompt by sigmoid(score)*sigmoid(presence)), masks [K,Q,288,288] fp16.
+    Same mathematics as ground_cKm followed by maskhead_qQ on every prompt; nothing crosses the host between the two."""
+    def __init__(self, ground, seg, img_pos_k, Q): super().__init__(); self.ground = ground; self.seg = seg; self.Q = Q; self.register_buffer("img_pos", img_pos_k.to(torch.float32))
+    def forward(self, fpn_0, fpn_1, fpn_2, text_feats, text_mask):
+        K = text_mask.shape[0]; img_feat = fpn_2.to(torch.float32).expand(K, -1, -1, -1)
+        scores, boxes, presence, hs, enc = self.ground(img_feat, self.img_pos, text_feats, text_mask)
+        probs = torch.sigmoid(scores.to(torch.float32)[:, :, 0]) * torch.sigmoid(presence.to(torch.float32)[:, 0])[:, None]
+        sel = probs.topk(self.Q, dim=1).indices                                                  # [K, Q]
+        hs_sel = torch.gather(hs, 1, sel[..., None].expand(-1, -1, hs.shape[-1]))
+        tf = text_feats.to(torch.float32); tm = text_mask.to(torch.bool)
+        out = self.seg(backbone_feats=[fpn_0.to(torch.float32), fpn_1.to(torch.float32), torch.zeros((1, 256, 72, 72), dtype=torch.float32)], obj_queries=hs_sel.to(torch.float32).unsqueeze(0),
+                       image_ids=torch.zeros((K,), dtype=torch.long), encoder_hidden_states=enc.to(torch.float32), prompt=tf, prompt_mask=tm)
+        return scores, boxes, presence, hs, sel, out["pred_masks"].to(torch.float16)
 decoder = model.transformer.decoder; decoder.compile_mode = None; decoder.compiled = True
 ch, cw = decoder._get_coords(72, 72, device="cpu"); decoder.compilable_cord_cache = (ch, cw); decoder.compilable_stored_size = (72, 72)
 wrapper = GroundingWrapper(model.transformer.encoder, decoder, model.dot_prod_scoring).cpu().eval()
@@ -118,4 +133,13 @@ with torch.inference_mode():
     torch.onnx.export(mw, minp, str(OUT / f"maskhead_q{QSEL}{suffix}.onnx"), opset_version=17, input_names=["fpn_0", "fpn_1", "enc", "text_feats", "text_mask", "hs_sel"], output_names=["masks"],
                       dynamic_axes={"enc": {1: "K"}, "text_feats": {1: "K"}, "text_mask": {0: "K"}, "hs_sel": {0: "K"}, "masks": {0: "K"}}, do_constant_folding=True, dynamo=False)
 print("exported maskhead_q%d %.0fs" % (QSEL, time.time() - t0), flush=True)
+if args.fused:
+    for K in BUCKETS:
+        fw = FusedWrapper(wrapper, seg, img_pos1.repeat(K, 1, 1, 1), QSEL).cpu().eval()
+        finp = (torch.zeros((1, 256, 288, 288)), torch.zeros((1, 256, 144, 144)), torch.zeros((1, 256, 72, 72)), torch.zeros((32, K, 256), dtype=torch.float16), torch.zeros((K, 32)))
+        with torch.inference_mode():
+            outs = fw(*finp); print("groundmask_c%d shapes:" % K, [tuple(o.shape) for o in outs], flush=True)
+            torch.onnx.export(fw, finp, str(OUT / f"groundmask_c{K}_q{QSEL}{suffix}.onnx"), opset_version=17, input_names=["fpn_0", "fpn_1", "fpn_2", "text_feats", "text_mask"],
+                              output_names=["scores", "boxes", "presence", "hs", "sel", "masks"], dynamic_axes=None, do_constant_folding=True, dynamo=False)
+        print("exported groundmask_c%d %.0fs" % (K, time.time() - t0), flush=True)
 print("EXPORT_DONE")

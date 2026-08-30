@@ -6,7 +6,7 @@ Constants written next to the graphs: pos72.npy (frame PE, 256ch), pe_mem.npy (m
 usage: python export_tracker.py --dart <DART root> --ckpt sam3.pt --out out/trk [--check] [--export]"""
 import sys, os, time, argparse, math, numpy as np
 ap = argparse.ArgumentParser(); ap.add_argument("--dart", required=True); ap.add_argument("--ckpt", required=True); ap.add_argument("--out", required=True)
-ap.add_argument("--check", action="store_true"); ap.add_argument("--v2", action="store_true", help="step v2: gathered memory keys with per-key RoPE, valid-key counts, shared layer-0 queries, LQMemAttn custom op when --plugin"); ap.add_argument("--plugin", action="store_true"); ap.add_argument("--trunk", default=None, help="npz with a real trunk output for the check"); ap.add_argument("--export", action="store_true"); ap.add_argument("--threads", type=int, default=16); a = ap.parse_args()
+ap.add_argument("--check", action="store_true"); ap.add_argument("--v3", action="store_true", help="step v3: v2 with query-side pruning (qidx, nq inputs)"); ap.add_argument("--v3-bg", action="store_true", help="v3 variant: background tokens also pass through layers 1-3 without memory (shared)"); ap.add_argument("--v2", action="store_true", help="step v2: gathered memory keys with per-key RoPE, valid-key counts, shared layer-0 queries, LQMemAttn custom op when --plugin"); ap.add_argument("--plugin", action="store_true"); ap.add_argument("--trunk", default=None, help="npz with a real trunk output for the check"); ap.add_argument("--export", action="store_true"); ap.add_argument("--threads", type=int, default=16); a = ap.parse_args()
 sys.path.insert(0, a.dart)
 import torch, torch.nn as nn, torch.nn.functional as F
 def _cpu(dev): return "cpu" if (dev is not None and str(dev).startswith("cuda")) else dev
@@ -101,6 +101,41 @@ class StepV2(nn.Module):
         key_fr = s.fr[keyidx]; key_fi = s.fi[keyidx]                                              # [B, Kn, 128]
         tp = tracker.obj_ptr_tpos_proj(get_1d_sine_pe(ptr_pos, dim=C)); ptr_tokens = ptrs.unflatten(-1, (C // MD, MD)).flatten(1, 2); pos_ptr = tp.repeat_interleave(C // MD, 0)[None]
         x = memory_attention_v2(src, pos_src, memtok.float(), mempos.float(), key_fr, key_fi, ptr_tokens, pos_ptr, nvalid); pix = x.transpose(1, 2).reshape(B, C, H, H)
+        h0 = hr0.expand(B, -1, -1, -1); h1 = hr1.expand(B, -1, -1, -1); fb = feat72.expand(B, -1, -1, -1)
+        _, _, ious, low, high, obj_ptr, obj_score = sam_heads(pix, h0, h1, None, MM_TRACK); ious = ious.max(-1, keepdim=True)[0]
+        return low, obj_ptr, obj_score, ious, encode_memory(fb, high, obj_score)
+def memory_attention_v3(src, pos_src, mem_tokens, pos_mem, key_fr, key_fi, ptr_tokens, pos_ptr, nvalid, qidx, nq, bg_layers=False):
+    """v2 restricted to the queries qidx [B,Nq] (grid indices; padded by repeating a valid index, nq [B] = valid counts). Layer-0 self-attention is shared over all
+    5184 tokens as in v2; every per-object computation (cross-attention, FFN, self-attention of layers 1-3) then runs on the Nq gathered tokens and the rest of
+    the map keeps the shared features. Padded query rows duplicate a valid token, are masked as keys, and so reproduce that token's row exactly."""
+    B = mem_tokens.shape[0]; nv_total = nvalid.to(torch.int32) + ptr_tokens.shape[1]
+    x = src + 0.1 * pos_src; L = enc.layers[0]
+    x2 = L.norm1(x); A = L.self_attn; q = rope(A.q_proj(x2), FR, FI); k = rope(A.k_proj(x2), FR, FI); nvs = torch.full((x2.shape[0],), N, dtype=torch.int32)
+    x = x + A.out_proj(attn_v2(q, k, A.v_proj(x2), nvs))                                       # [1, N, C], shared
+    xq = x[0][qidx]; q_fr = FR[qidx]; q_fi = FI[qidx]                                           # gathered queries [B, Nq, C] and their rotary tables
+    if bg_layers:                                                                                 # background tokens: layers 1-3 without the memory (self-attention + FFN), shared over objects
+        xb = x
+        for L in enc.layers[1:]:
+            x2 = L.norm1(xb); A = L.self_attn; q = rope(A.q_proj(x2), FR, FI); k = rope(A.k_proj(x2), FR, FI); xb = xb + A.out_proj(attn_v2(q, k, A.v_proj(x2), nvs))
+            x2 = L.norm3(xb); xb = xb + L.linear2(F.relu(L.linear1(x2)))
+        base = enc.norm(xb)
+    else: base = enc.norm(x)
+    for li, L in enumerate(enc.layers):
+        if li > 0:
+            x2 = L.norm1(xq); A = L.self_attn; q = rope_tokens(A.q_proj(x2), q_fr, q_fi); k = rope_tokens(A.k_proj(x2), q_fr, q_fi); xq = xq + A.out_proj(attn_v2(q, k, A.v_proj(x2), nq))
+        x2 = L.norm2(xq); A = L.cross_attn_image; q = rope_tokens(A.q_proj(x2), q_fr, q_fi)
+        ksp = rope_tokens(A.k_proj(mem_tokens + pos_mem), key_fr, key_fi); kpt = A.k_proj(ptr_tokens + pos_ptr); k = torch.cat([kpt, ksp], 1); v = torch.cat([A.v_proj(ptr_tokens), A.v_proj(mem_tokens)], 1)
+        xq = xq + A.out_proj(attn_v2(q, k, v, nv_total))
+        x2 = L.norm3(xq); xq = xq + L.linear2(F.relu(L.linear1(x2)))
+    return base.expand(B, -1, -1).scatter(1, qidx[..., None].expand(-1, -1, C), enc.norm(xq))
+class StepV3(nn.Module):
+    """StepV2 plus qidx [B,Nq] int64 and nq [B] int32: memory attention only for the selected queries (query-side pruning)"""
+    def __init__(s, bg_layers=False): super().__init__(); s.tr = tracker; s.bg = bg_layers; s.register_buffer("pos72", POS72); s.register_buffer("fr", FR); s.register_buffer("fi", FI)
+    def forward(s, feat72, hr0, hr1, memtok, mempos, keyidx, nvalid, ptrs, ptr_pos, qidx, nq):
+        B = memtok.shape[0]; src = feat72.flatten(2).transpose(1, 2); pos_src = s.pos72.flatten(2).transpose(1, 2)
+        key_fr = s.fr[keyidx]; key_fi = s.fi[keyidx]
+        tp = tracker.obj_ptr_tpos_proj(get_1d_sine_pe(ptr_pos, dim=C)); ptr_tokens = ptrs.unflatten(-1, (C // MD, MD)).flatten(1, 2); pos_ptr = tp.repeat_interleave(C // MD, 0)[None]
+        x = memory_attention_v3(src, pos_src, memtok.float(), mempos.float(), key_fr, key_fi, ptr_tokens, pos_ptr, nvalid, qidx, nq, s.bg); pix = x.transpose(1, 2).reshape(B, C, H, H)
         h0 = hr0.expand(B, -1, -1, -1); h1 = hr1.expand(B, -1, -1, -1); fb = feat72.expand(B, -1, -1, -1)
         _, _, ious, low, high, obj_ptr, obj_score = sam_heads(pix, h0, h1, None, MM_TRACK); ious = ious.max(-1, keepdim=True)[0]
         return low, obj_ptr, obj_score, ious, encode_memory(fb, high, obj_score)
@@ -222,4 +257,17 @@ if a.v2:
                               input_names=["feat72", "hr0", "hr1", "memtok", "mempos", "keyidx", "nvalid", "ptrs", "ptr_pos"], output_names=["masks", "obj_ptr", "obj_score", "iou", "maskmem"],
                               dynamic_axes={"memtok": {0: "B", 1: "Kn"}, "mempos": {0: "B", 1: "Kn"}, "keyidx": {0: "B", 1: "Kn"}, "nvalid": {0: "B"}, "ptrs": {0: "B", 1: "P"}, "ptr_pos": {0: "P"}, "masks": {0: "B"}, "obj_ptr": {0: "B"}, "obj_score": {0: "B"}, "iou": {0: "B"}, "maskmem": {0: "B"}},
                               dynamo=False, do_constant_folding=True, custom_opsets={"": 17}); print("exported trk_step_v2", "plugin" if a.plugin else "")
+if a.v3:
+    stepv3 = StepV3(bg_layers=a.v3_bg).eval()
+    _interp = F.interpolate if not hasattr(F, '_lq_interp') else F._lq_interp; F._lq_interp = _interp
+    def interp_noaa3(x, size=None, scale_factor=None, mode="nearest", align_corners=None, recompute_scale_factor=None, antialias=False): return _interp(x, size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners, recompute_scale_factor=recompute_scale_factor)
+    F.interpolate = interp_noaa3
+    with torch.no_grad():
+        if 'feat72' not in dir(): neck = Neck().eval(); trunk = torch.randn(1, 1024, H, H); feat72, hr0, hr1 = neck(trunk)
+        Bn, M, P, Kn, Nq = 2, 3, 4, 2 * N + 40, 1500; memtok = (torch.randn(Bn, Kn, MD) * 0.3).half(); mempos = (torch.randn(Bn, Kn, MD) * 0.3).half(); keyidx = torch.randint(0, N, (Bn, Kn)); nvalid = torch.tensor([Kn, Kn - 40], dtype=torch.int32)
+        ptrs = torch.randn(Bn, P, C) * 0.3; ptr_pos = torch.tensor([8.0, 1.0, 2.0, 3.0]) / (MAXPTR - 1); qidx = torch.randint(0, N, (Bn, Nq)); nq = torch.tensor([Nq, Nq - 100], dtype=torch.int32)
+        torch.onnx.export(stepv3, (feat72, hr0, hr1, memtok, mempos, keyidx, nvalid, ptrs, ptr_pos, qidx, nq), f"{a.out}/trk_step_v3{'b' if a.v3_bg else ''}.onnx", opset_version=17,
+                          input_names=["feat72", "hr0", "hr1", "memtok", "mempos", "keyidx", "nvalid", "ptrs", "ptr_pos", "qidx", "nq"], output_names=["masks", "obj_ptr", "obj_score", "iou", "maskmem"],
+                          dynamic_axes={"memtok": {0: "B", 1: "Kn"}, "mempos": {0: "B", 1: "Kn"}, "keyidx": {0: "B", 1: "Kn"}, "nvalid": {0: "B"}, "ptrs": {0: "B", 1: "P"}, "ptr_pos": {0: "P"}, "qidx": {0: "B", 1: "Nq"}, "nq": {0: "B"}, "masks": {0: "B"}, "obj_ptr": {0: "B"}, "obj_score": {0: "B"}, "iou": {0: "B"}, "maskmem": {0: "B"}},
+                          dynamo=False, do_constant_folding=True); print("exported trk_step_v3")
 print("DONE %.0fs" % (time.time() - t0))

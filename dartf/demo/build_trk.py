@@ -17,6 +17,7 @@ logger = trt.Logger(trt.Logger.WARNING); b = trt.Builder(logger); net = b.create
 assert p.parse_from_file(onnx_path), [p.get_error(i) for i in range(p.num_errors)]
 cfg = b.create_builder_config(); cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30)
 if not fp32: cfg.set_flag(trt.BuilderFlag.FP16)
+if "--int8" in sys.argv: cfg.set_flag(trt.BuilderFlag.INT8)
 prof = b.create_optimization_profile()
 for i in range(net.num_inputs):
     t = net.get_input(i); s = list(t.shape)
