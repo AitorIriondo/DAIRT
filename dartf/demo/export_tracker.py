@@ -81,14 +81,14 @@ def rope_tokens(x, fr, fi):
     """x [B, T, 256] with per-token tables fr/fi [B or 1, T, 128]"""
     xr = x.float().unflatten(-1, (-1, 2)); xre, xim = xr[..., 0], xr[..., 1]; return torch.stack([xre * fr - xim * fi, xre * fi + xim * fr], -1).flatten(-2).type_as(x)
 def memory_attention_v2(src, pos_src, mem_tokens, pos_mem, key_fr, key_fi, ptr_tokens, pos_ptr, nvalid):
-    """src [1,5184,256] (shared), mem_tokens/pos_mem [B,Kn,64], key_fr/key_fi [B,Kn,128] per-key RoPE tables, ptr_tokens [B,4P,64], pos_ptr [1,4P,64], nvalid [B] (memory keys; pointers appended and always valid)"""
+    """src [1,5184,256] (shared), mem_tokens/pos_mem [B,Kn,64], key_fr/key_fi [B,Kn,128] per-key RoPE tables, ptr_tokens [B,4P,64], pos_ptr [1,4P,64], nvalid [B] (memory keys; pointers are placed first and always valid)"""
     B = mem_tokens.shape[0]; nv_total = nvalid.to(torch.int32) + ptr_tokens.shape[1]
     x = src + 0.1 * pos_src                                                    # [1, 5184, 256]: layer-0 self attention is shared by every object
     for li, L in enumerate(enc.layers):
         x2 = L.norm1(x); A = L.self_attn; q = rope(A.q_proj(x2), FR, FI); k = rope(A.k_proj(x2), FR, FI); nvs = torch.full((x2.shape[0],), N, dtype=torch.int32)
         x = x + A.out_proj(attn_v2(q, k, A.v_proj(x2), nvs))
         x2 = L.norm2(x); A = L.cross_attn_image; q = rope(A.q_proj(x2), FR, FI)                   # layer 0: q of batch 1, broadcast inside the attention
-        ksp = rope_tokens(A.k_proj(mem_tokens + pos_mem), key_fr, key_fi); kpt = A.k_proj(ptr_tokens + pos_ptr); k = torch.cat([ksp, kpt], 1); v = torch.cat([A.v_proj(mem_tokens), A.v_proj(ptr_tokens)], 1)
+        ksp = rope_tokens(A.k_proj(mem_tokens + pos_mem), key_fr, key_fi); kpt = A.k_proj(ptr_tokens + pos_ptr); k = torch.cat([kpt, ksp], 1); v = torch.cat([A.v_proj(ptr_tokens), A.v_proj(mem_tokens)], 1)   # pointers first: the leading-count mask then keeps every pointer and exactly nvalid memory keys (padding past nvalid is inert)
         x = x + A.out_proj(attn_v2(q, k, v, nv_total))                                            # broadcast add: from here on x is per object
         x2 = L.norm3(x); x = x + L.linear2(F.relu(L.linear1(x2)))
     return enc.norm(x)
@@ -125,6 +125,11 @@ class Init(nn.Module):
         appearing = torch.any(m.flatten(1) > 0, dim=1)[:, None].float(); obj_score = 20.0 * appearing - 10.0
         obj_ptr = appearing * obj_ptr + (1 - appearing) * tracker.no_obj_ptr
         return obj_ptr, encode_memory(fb, high, obj_score)
+class Init288(nn.Module):
+    """same as Init but prompted with the segmentation head's 288x288 mask logits (upsampled inside the graph): no host-side mask processing"""
+    def __init__(s): super().__init__(); s.tr = tracker
+    def forward(s, feat72, hr0, hr1, mask288):
+        m = (F.interpolate(mask288.float()[:, None], size=(1008, 1008), mode="bilinear", align_corners=False) > 0).float(); return init(feat72, hr0, hr1, m)
 class Step(nn.Module):
     def __init__(s): super().__init__(); s.tr = tracker; s.register_buffer("pos72", POS72); s.register_buffer("pe_mem", PE_MEM)
     def forward(s, feat72, hr0, hr1, mem, tpos_idx, ptrs, ptr_pos):
@@ -184,6 +189,9 @@ if a.export:
         B = 2; mask_in = (torch.rand(B, 1, 1008, 1008) > 0.7).float()
         torch.onnx.export(init, (feat72, hr0, hr1, mask_in), f"{a.out}/trk_init.onnx", opset_version=17, input_names=["feat72", "hr0", "hr1", "mask_in"], output_names=["obj_ptr", "maskmem"],
                           dynamic_axes={"mask_in": {0: "B"}, "obj_ptr": {0: "B"}, "maskmem": {0: "B"}}, dynamo=False, do_constant_folding=True); print("exported trk_init")
+        init288 = Init288().eval(); m288 = (torch.randn(B, 288, 288) * 3).half()
+        torch.onnx.export(init288, (feat72, hr0, hr1, m288), f"{a.out}/trk_init288.onnx", opset_version=17, input_names=["feat72", "hr0", "hr1", "mask288"], output_names=["obj_ptr", "maskmem"],
+                          dynamic_axes={"mask288": {0: "B"}, "obj_ptr": {0: "B"}, "maskmem": {0: "B"}}, dynamo=False, do_constant_folding=True); print("exported trk_init288")
         M, P = 3, 4; mem = torch.randn(B, M, MD, H, H) * 0.3; tpos_idx = torch.tensor([NM - 1, NM - 6, NM - 7 + 6 - 6]); tpos_idx = torch.tensor([6, 1, 5]); ptrs = torch.randn(B, P, C) * 0.3; ptr_pos = torch.tensor([8.0, 1.0, 2.0, 3.0]) / (MAXPTR - 1)
         torch.onnx.export(step, (feat72, hr0, hr1, mem, tpos_idx, ptrs, ptr_pos), f"{a.out}/trk_step.onnx", opset_version=17, input_names=["feat72", "hr0", "hr1", "mem", "tpos_idx", "ptrs", "ptr_pos"], output_names=["masks", "obj_ptr", "obj_score", "iou", "maskmem"],
                           dynamic_axes={"mem": {0: "B", 1: "M"}, "tpos_idx": {0: "M"}, "ptrs": {0: "B", 1: "P"}, "ptr_pos": {0: "P"}, "masks": {0: "B"}, "obj_ptr": {0: "B"}, "obj_score": {0: "B"}, "iou": {0: "B"}, "maskmem": {0: "B"}}, dynamo=False, do_constant_folding=True); print("exported trk_step")

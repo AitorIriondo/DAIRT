@@ -14,3 +14,6 @@ $NVCC -O3 -std=c++17 -arch=sm_$ARCH --use_fast_math --expt-relaxed-constexpr -DL
   lq_plugins.cu lq_attn_plugin.cu lq_block_plugins.cu lq_ground_plugins.cu lq_memattn_plugin.cu -o lq_plugins.so -L "$TRT_LIB" -lnvinfer -lcublasLt -lcublas
 echo "built plugins/lq_plugins.so for sm_$ARCH"
 python3 check_plugin.py "$(pwd)/lq_plugins.so" || true
+
+# torch-free tracker helpers (row gather / transpose kernels), loaded through ctypes by demo/sam3_track_np.py
+$NVCC -O3 -arch=sm_$ARCH -Xcompiler -fPIC -shared lq_util.cu -o lq_util.so && echo "built plugins/lq_util.so"

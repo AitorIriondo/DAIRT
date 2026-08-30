@@ -37,18 +37,39 @@ python demo/dump_maskhead_calib.py --assets assets calib.npz input.mp4:lemon,str
 
 ## Heads and trackers
 
-Two switches of `demo/run_video.py` select what runs per frame; everything else (backbone, text encoder once per prompt set, detector head) is the same.
+Two switches of `demo/run_video.py` select what runs per frame; everything else (backbone, text encoder once per prompt set, detector head) is the same. `--pipeline` overlaps the backbone of the next frame with the head, tracker and output of the current one (a decode thread plus a second CUDA stream, as in DART's runner): 2.0× / 1.7× on the 4090 and 1.24× / 1.17× on the Orin for boxes / masks in headless runs.
 
 | `--heads` | what runs | cost per frame (4 prompts) | use |
 |---|---|---|---|
 | `boxes` | detector head only | RTX 4090: 16 ms head; Orin: 94 ms head (K=4 bucket) | detection, counting, box tracking |
 | `masks` (default) | detector head + SAM3 segmentation head on the top 32 queries of each active prompt | adds 12 ms on the 4090, 31 ms on the Orin (phase head; 29 ms INT8) | masks, mask-based association |
 
-| `--tracker` | what it does | quality (vehicle clip, appearances / new ids per frame) | cost |
+| `--tracker` | what it does | MOT17 half split, zero shot (HOTA / MOTA / IDF1) | cost |
 |---|---|---|---|
-| `none` | per-frame detections, no identities | — | none |
-| `light` (default) | association by mask IoU (or box IoU with `--heads boxes`), constant-velocity prediction and cosine similarity of the DETR query embeddings; coasting, class vote | 0.35 / 0.44 with masks, 0.38 / 0.51 with boxes | CPU only, negligible |
-| `sam3` | `light` plus the SAM3 native tracker: memories refreshed from detector masks every `--refresh` frames, propagation with memory attention for confirmed tracks the detector missed (`--sam3-budget` per frame), memory keys pruned to the object's neighbourhood plus a background grid (`--sam3-prune`, 0 = full memory), `--sam3-adaptive` for a shallower memory on stable objects | 0.37 / 0.39 at budget 8 (on dense clips no better than `light`; meant for few objects with occlusions) | Orin 18 ms per propagated object, 4090 ~6 ms; refresh 3 ms per object; the memory bank stays on the device |
+| `none` | per-frame detections, no identities | detection only: DetA 34.7 | none |
+| `light` (default) | association by mask IoU (or box IoU with `--heads boxes`), constant-velocity prediction and cosine similarity of the DETR query embeddings; coasting, class vote | boxes 40.0 / 26.9 / 46.6, masks 41.8 / 24.9 / 49.0 (score 0.5); boxes at score 0.7: 41.7 / 33.7 / 49.6 | CPU only, negligible |
+| `sam3` | `light` plus the SAM3 native tracker (`demo/sam3_track_np.py`: no torch needed; raw CUDA buffers, two small gather kernels, CUDA-graph replay of the engine calls): memories refreshed from detector masks every `--refresh` frames, propagation with memory attention for confirmed tracks the detector missed (`--sam3-budget` per frame), memory keys pruned to the object's neighbourhood plus a background grid (`--sam3-prune`, 0 = full memory), `--sam3-adaptive` for a shallower memory on stable objects | masks 42.5 / 16.8 / 49.2: best association (AssA 50.6) but it keeps occluded objects alive, which MOT17 counts as false positives | 4090 ~6 ms per propagated object, Orin ~33 ms; +25 ms/frame on MOT17 (4090); the memory bank stays on the device |
+
+## MOT17 evaluation (train half, TrackEval)
+
+`demo/eval_mot.py` runs any configuration headless on the standard validation half of the seven MOT17 training sequences (second halves, 2622 frames; the Hugging Face mirror `Morrison1025/MOT17` ships it as `ablation/`) and scores it with [TrackEval](https://github.com/JonathonLuiten/TrackEval) (HOTA, CLEAR, Identity). Prompt "person", no training on MOT17.
+
+```bash
+python demo/eval_mot.py --mot /data/MOT17 --split ablation --trackeval /path/to/TrackEval --out out/mot --runner-args "--assets assets --ground assets/ground_c1m_fp16.plan --img-pos assets/img_pos_c1.npy" \
+  --configs "boxes_light:--heads boxes --tracker light" "masks_light:--tracker light" "masks_sam3:--tracker sam3 --sam3-budget 8"
+python demo/mot_table.py out/mot
+```
+
+| config | HOTA | DetA | AssA | MOTA | IDF1 | IDSW | RTX 4090 ms/frame | AGX Orin ms/frame |
+|---|---|---|---|---|---|---|---|---|
+| boxes, no tracker | 12.6 | 34.7 | 4.8 | -14.0 | 9.8 | 18644 | 25 | 186 |
+| boxes, light | 40.0 | 37.5 | 44.0 | 26.9 | 46.6 | 352 | 25 | 186 |
+| boxes, light, score 0.7 | 41.7 | 38.5 | 46.4 | 33.7 | 49.6 | 249 | 25 | 186* |
+| masks, light | 41.8 | 37.7 | 47.6 | 24.9 | 49.0 | 288 | 33 | 239 |
+| masks, light, score 0.6 | 42.3 | 38.3 | 47.9 | 28.1 | 50.0 | 248 | 33 | 239* |
+| masks, sam3 | 42.5 | 36.6 | 50.6 | 16.8 | 49.2 | 263 | 62 | 416 |
+
+ms are wall time per frame with `--pipeline`, headless, single prompt (K=1 head bucket), measured on MOT17-02 (299 frames); * = the detection score does not change the per-frame cost, so the base configuration's time is reported. Without the pipeline the 4090 takes 52 / 56 / 85 ms and the Orin 231 / 279 / 459 ms (boxes / masks / sam3). The sam3 rows use the torch-free driver (CUDA-graph replay of every tracker engine call, memory bank and key gathers on the device); on the Orin the tracker propagates 4.6 objects per frame on this crowded benchmark and the step engine, not the driver, sets its cost (about 33 ms per object). The Orin runs use the same engines and agree with the 4090 within noise (masks + light 41.9 vs 41.8 HOTA; masks + sam3 42.0 vs 42.5, both with the torch-free driver; the torch driver gives 42.3 on the 4090). Mask association is worth about +2 HOTA over box association; SAM3 propagation buys association at the price of false positives on this benchmark.
 
 ## Examples
 
