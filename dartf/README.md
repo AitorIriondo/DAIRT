@@ -14,19 +14,41 @@ DART_ROOT=/path/to/DART CALIB_IMAGES=data/calib CALIB_IDS=calib/calib_ids.json C
 # 2) evaluate against the FP32 engine on COCO images (detection counts, recall, IoU)
 python runtime/eval_pipeline.py --cand out/vision_int8.plan --ref out/vision_fp32.plan --text <text.plan> --ground <ground.plan> --dev-images 96
 
-# 3) video demo with boxes and masks (grounding head that also emits its queries, plus the SAM3 segmentation head as TensorRT engines)
-python demo/export_ground_mask.py --dart /path/to/DART --ckpt sam3.pt --out assets      # ground_c4m.onnx, maskhead_q32.onnx, img_pos_c4.npy
+# 3) video demo: detector head (K=4 prompt bucket) and, optionally, the SAM3 segmentation head as TensorRT engines
+python demo/export_ground_mask.py --dart /path/to/DART --ckpt sam3.pt --out assets --phase-conv   # ground_c4m.onnx, maskhead_q32_phase.onnx (exact, 24% faster head), img_pos_c4.npy
 python runtime/build_engine.py assets/ground_c4m.onnx assets/ground_c4m_fp16.plan --no-int8
-python demo/build_mask_engine.py assets/maskhead_q32.onnx assets/maskhead_q32_fp16.plan 1 4 8
-LQ_PLUGINS=plugins/lq_plugins.so python demo/run_video.py input.mp4 out.mp4 "lemon,strawberry" --assets assets --name "Your Name" --affiliation "Your lab"
+python demo/build_mask_engine.py assets/maskhead_q32_phase.onnx assets/maskhead_q32_phase_fp16.plan 1 4 8
+LQ_PLUGINS=plugins/lq_plugins.so python demo/run_video.py input.mp4 out.mp4 "lemon,strawberry" --assets assets --heads masks --tracker light --name "Your Name" --affiliation "Your lab"
+#   --heads boxes         detector only, no segmentation head (skips its engine and its ms per frame)
+#   --tracker none        raw per-frame detections;  --tracker light  lightweight tracker (default);  --tracker sam3  SAM3 native propagation for lost tracks (needs step 4)
+
+# 4) optional: SAM3 native tracker engines (for --tracker sam3) and an INT8 mask head
+python demo/export_tracker.py --dart /path/to/DART --ckpt sam3.pt --out assets --export --v2 && python demo/build_trk.py assets/trk_step_v2.onnx assets/trk_step_v2_fp16.plan "B=1:2:8,Kn=1024:15552:36288,P=1:6:19"
+python demo/build_trk.py assets/trk_neck.onnx assets/trk_neck_fp16.plan "B=1:1:1" && python demo/build_trk.py assets/trk_init.onnx assets/trk_init_fp16.plan "B=1:4:32"
+python demo/dump_maskhead_calib.py --assets assets calib.npz input.mp4:lemon,strawberry:20,140,260 && python demo/quant_maskhead.py assets/maskhead_q32.onnx calib.npz assets/maskhead_q32_int8.onnx
 ```
 
 ## Installation
 
 - TensorRT 10.x (tested 10.16.2 on JetPack 7.2 and 10.16.1 on x86), CUDA 12.4+ or 13.x, an sm80+ NVIDIA GPU (tested: Jetson AGX Orin SM87, RTX 4090 SM89; `build.sh` picks a 3-stage GEMM pipeline on sm86/sm89, whose 99 KB of shared memory per block cannot hold the 5-stage tiles).
 - CUTLASS 3.5.1 headers: `git clone --depth 1 --branch v3.5.1 https://github.com/NVIDIA/cutlass.git third_party/cutlass`
-- Python 3.10+: `pip install onnx onnxruntime numpy tensorrt torch transformers pillow` (CPU torch is enough).
+- Python 3.10+: `pip install onnx onnxruntime numpy tensorrt torch transformers pillow` (CPU torch is enough for the export and quantization pipeline; the video demo needs CUDA torch, plus `opencv-python scipy ffmpeg`).
 - DART (this repository) for the HF backbone ONNX export; `facebook/sam3` weights from the Hugging Face hub.
+
+## Heads and trackers
+
+Two switches of `demo/run_video.py` select what runs per frame; everything else (backbone, text encoder once per prompt set, detector head) is the same.
+
+| `--heads` | what runs | cost per frame (4 prompts) | use |
+|---|---|---|---|
+| `boxes` | detector head only | RTX 4090: 16 ms head; Orin: 94 ms head (K=4 bucket) | detection, counting, box tracking |
+| `masks` (default) | detector head + SAM3 segmentation head on the top 32 queries of each active prompt | adds 12 ms on the 4090, 31 ms on the Orin (phase head; 29 ms INT8) | masks, mask-based association |
+
+| `--tracker` | what it does | quality (vehicle clip, appearances / new ids per frame) | cost |
+|---|---|---|---|
+| `none` | per-frame detections, no identities | — | none |
+| `light` (default) | association by mask IoU (or box IoU with `--heads boxes`), constant-velocity prediction and cosine similarity of the DETR query embeddings; coasting, class vote | 0.35 / 0.44 with masks, 0.38 / 0.51 with boxes | CPU only, negligible |
+| `sam3` | `light` plus the SAM3 native tracker: memories refreshed from detector masks every `--refresh` frames, propagation with memory attention for confirmed tracks the detector missed (`--sam3-budget` per frame), memory keys pruned to the object's neighbourhood plus a background grid (`--sam3-prune`, 0 = full memory), `--sam3-adaptive` for a shallower memory on stable objects | 0.37 / 0.39 at budget 8 (on dense clips no better than `light`; meant for few objects with occlusions) | Orin 18 ms per propagated object, 4090 ~6 ms; refresh 3 ms per object; the memory bank stays on the device |
 
 ## Examples
 
@@ -63,7 +85,7 @@ COCO val2017 box AP (5000 images, 80 category prompts, official SAM3 protocol: n
 
 Grounding head: 21.9 ms per class after exact prefix sharing (24.2 before); CUDA-graph replay takes the trunk to 162.6 ms.
 
-On an RTX 4090 the same INT8 engine runs the backbone in about 23 ms per frame; with the K=4 grounding bucket (16 ms) and the segmentation head on the top 32 queries of each active prompt (2 to 10 ms) the video demo runs at 20 to 25 frames per second end to end, including decoding and rendering.
+On an RTX 4090 the same INT8 engine runs the backbone in about 23 ms per frame; with the K=4 detector bucket (16 ms) and the segmentation head (12 ms at four prompts) the video demo runs at 20 to 25 frames per second end to end, including decoding and rendering; `--heads boxes` removes the segmentation head.
 
 ## Documentation
 

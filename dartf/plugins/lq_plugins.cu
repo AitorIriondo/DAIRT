@@ -351,6 +351,7 @@ private: std::vector<PluginField> fields_; PluginFieldCollection fc_{};
 };
 static LQRopeCreator gRopeCreator;
 
+extern "C" IPluginCreatorInterface* lq_memattn_creator();
 extern "C" {
 // TensorRT looks for this symbol when a plugin library is passed via --plugins / getPluginRegistry()->loadLibrary()
 IPluginCreatorInterface* lq_attn_creator();
@@ -362,5 +363,5 @@ IPluginCreatorInterface* lq_encffn_creator();
 void setLoggerFinder(ILoggerFinder*) {}   // required for IPluginRegistry::loadLibrary / trtexec --dynamicPlugins
 IPluginCreatorInterface* const* getCreators(int32_t& nbCreators) { nbCreators = 8; static IPluginCreatorInterface* list[8] = {&gCreator, &gRopeCreator, lq_attn_creator(), lq_mlp_creator(), lq_qkv_creator(), lq_attnproj_creator(), lq_encsa_creator(), lq_encffn_creator()}; return list; }
 // explicit registration for ctypes users (call after loading; never at static-init time)
-void lq_register() { auto* reg = getPluginRegistry(); if (reg) { reg->registerCreator(gCreator, kNamespace); reg->registerCreator(gRopeCreator, kNamespace); reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_attn_creator()), kNamespace); reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_mlp_creator()), kNamespace); reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_qkv_creator()), kNamespace); reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_attnproj_creator()), kNamespace); reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_encsa_creator()), kNamespace); reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_encffn_creator()), kNamespace); } }
+void lq_register() { auto* reg = getPluginRegistry(); if (reg) { reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_memattn_creator()), kNamespace); reg->registerCreator(gCreator, kNamespace); reg->registerCreator(gRopeCreator, kNamespace); reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_attn_creator()), kNamespace); reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_mlp_creator()), kNamespace); reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_qkv_creator()), kNamespace); reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_attnproj_creator()), kNamespace); reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_encsa_creator()), kNamespace); reg->registerCreator(*static_cast<IPluginCreatorV3One*>(lq_encffn_creator()), kNamespace); } }
 }

@@ -4,6 +4,7 @@ onnx, plan, kmin, kopt, kmax = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(s
 logger = trt.Logger(trt.Logger.WARNING); b = trt.Builder(logger); net = b.create_network(0); p = trt.OnnxParser(net, logger)
 assert p.parse_from_file(onnx), [p.get_error(i) for i in range(p.num_errors)]
 cfg = b.create_builder_config(); cfg.set_flag(trt.BuilderFlag.FP16); cfg.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30)
+if "--int8" in sys.argv: cfg.set_flag(trt.BuilderFlag.INT8)
 prof = b.create_optimization_profile()
 for i in range(net.num_inputs):
     t = net.get_input(i); s = list(t.shape)

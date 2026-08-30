@@ -11,6 +11,6 @@ case "$ARCH" in 86|89) STAGES=${STAGES:-3};; *) STAGES=${STAGES:-5};; esac   # 9
 [ -f "$CUTLASS/cutlass/cutlass.h" ] || { echo "CUTLASS headers not found at $CUTLASS (see ../third_party/README.md)"; exit 1; }
 cp ../kernels/lq_attn_kernel.cuh . 2>/dev/null || true
 $NVCC -O3 -std=c++17 -arch=sm_$ARCH --use_fast_math --expt-relaxed-constexpr -DLQ_STAGES=$STAGES -Xcompiler -fPIC -shared -I "$CUTLASS" -I "$TRT_INC" \
-  lq_plugins.cu lq_attn_plugin.cu lq_block_plugins.cu lq_ground_plugins.cu -o lq_plugins.so -L "$TRT_LIB" -lnvinfer -lcublasLt -lcublas
+  lq_plugins.cu lq_attn_plugin.cu lq_block_plugins.cu lq_ground_plugins.cu lq_memattn_plugin.cu -o lq_plugins.so -L "$TRT_LIB" -lnvinfer -lcublasLt -lcublas
 echo "built plugins/lq_plugins.so for sm_$ARCH"
 python3 check_plugin.py "$(pwd)/lq_plugins.so" || true

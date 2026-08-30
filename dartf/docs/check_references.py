@@ -6,6 +6,7 @@ REFS = [  # (arxiv id, words that must appear in the title, short label)
     ("2210.17323", ["gptq", "post-training", "quantization"], "GPTQ"),
     ("2211.10438", ["smoothquant"], "SmoothQuant"),
     ("2404.00456", ["quarot"], "QuaRot"),
+    ("2401.15024", ["slicegpt"], "SliceGPT"),
     ("2405.16406", ["spinquant"], "SpinQuant"),
     ("2307.08691", ["flashattention-2"], "FlashAttention-2"),
     ("2205.14135", ["flashattention"], "FlashAttention"),
@@ -25,6 +26,7 @@ REFS = [  # (arxiv id, words that must appear in the title, short label)
     ("2104.09864", ["roformer"], "RoPE"),
     ("2203.16527", ["exploring plain vision transformer backbones"], "ViTDet"),
     ("2511.16719", ["sam 3"], "SAM 3"),
+    ("2603.11441", ["detect", "anything"], "DART"),
 ]
 def fetch(aid):
     req = urllib.request.Request(f"https://arxiv.org/bibtex/{aid}", headers={"User-Agent": "dartf-refcheck"}); return urllib.request.urlopen(req, timeout=30).read().decode("utf-8")
