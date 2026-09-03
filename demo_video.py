@@ -52,8 +52,9 @@ from sam3.model.sam3_multiclass_fast import Sam3MultiClassPredictorFast
 from demo_multiclass import CLASS_COLOURS
 
 
-def draw_detections_cv2(frame_bgr, results, class_names, tracks=None):
-    """Draw boxes and labels on an OpenCV BGR frame (in-place, fast).
+def draw_detections_cv2(frame_bgr, results, class_names, tracks=None,
+                        mask_alpha=0.45):
+    """Draw masks, boxes and labels on an OpenCV BGR frame (in-place, fast).
 
     Args:
         frame_bgr: BGR frame to annotate.
@@ -61,11 +62,39 @@ def draw_detections_cv2(frame_bgr, results, class_names, tracks=None):
         class_names: Ordered list of class names for colour assignment.
         tracks: Optional list of STrack objects from ByteTrack. When
             provided, draws track IDs instead of raw detections.
+        mask_alpha: Opacity for the mask overlay (0 = off, 1 = opaque).
+            Masks are only present when the predictor runs with
+            detection_only=False.
     """
     n_colours = len(CLASS_COLOURS)
     class_to_colour = {
         name: CLASS_COLOURS[i % n_colours] for i, name in enumerate(class_names)
     }
+
+    # Blend masks underneath so boxes and labels stay legible on top.
+    # Masks come from the detections, not the tracks, so they are drawn the
+    # same way whether or not tracking is enabled.
+    masks = results.get("masks") if results is not None else None
+    if masks is not None and mask_alpha > 0:
+        overlay = frame_bgr.astype(np.float32)
+        mask_layer = np.zeros_like(overlay)
+        mask_weight = np.zeros(frame_bgr.shape[:2] + (1,), dtype=np.float32)
+        for i in range(len(masks)):
+            cls_name = results["class_names"][i]
+            colour_rgb = class_to_colour.get(cls_name, CLASS_COLOURS[0])
+            colour_bgr = np.array(
+                [colour_rgb[2], colour_rgb[1], colour_rgb[0]], dtype=np.float32
+            )
+            m = masks[i].cpu().numpy().astype(bool)
+            mask_layer[m] += colour_bgr
+            mask_weight[m] += 1.0
+
+        valid = mask_weight[..., 0] > 0
+        mask_layer[valid] /= mask_weight[valid]
+        overlay[valid] = (
+            overlay[valid] * (1 - mask_alpha) + mask_layer[valid] * mask_alpha
+        )
+        frame_bgr[:] = overlay.astype(np.uint8)
 
     if tracks is not None:
         # Draw tracked objects with persistent IDs
@@ -211,6 +240,15 @@ def main():
     )
     # Tracking
     parser.add_argument(
+        "--masks", action="store_true",
+        help="Generate and overlay segmentation masks (slower). Not "
+             "compatible with --trt-enc-dec, which has no mask outputs.",
+    )
+    parser.add_argument(
+        "--mask-alpha", type=float, default=0.45,
+        help="Mask overlay opacity when --masks is set (default: 0.45)",
+    )
+    parser.add_argument(
         "--track", action="store_true",
         help="Enable ByteTrack multi-object tracking",
     )
@@ -245,6 +283,14 @@ def main():
              "Run scripts/block_pruner_search.py to find optimal pruning order."
     )
     args = parser.parse_args()
+
+    if args.masks and args.trt_enc_dec is not None:
+        parser.error(
+            "--masks is not compatible with --trt-enc-dec: the exported "
+            "enc-dec engine returns only scores and boxes, not the hidden "
+            "states the mask decoder needs. Drop --trt-enc-dec to run masks "
+            "(the TRT backbone via --trt still applies)."
+        )
 
     if args.coco:
         from sam3.coco_classes import COCO_CLASSES
@@ -387,7 +433,7 @@ def main():
         device=device,
         resolution=args.imgsz,
         use_fp16=True,
-        detection_only=True,
+        detection_only=not args.masks,
         trt_engine_path=args.trt,
         compile_mode=args.compile if backbone_mode == "compile" else None,
         trt_enc_dec_engine_path=args.trt_enc_dec,
@@ -536,6 +582,7 @@ def main():
         if writer is not None or args.display:
             annotated = draw_detections_cv2(
                 frame_bgr.copy(), results, args.classes, tracks=tracks,
+                mask_alpha=args.mask_alpha if args.masks else 0.0,
             )
             if writer is not None:
                 writer.write(annotated)
