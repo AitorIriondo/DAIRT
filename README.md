@@ -762,5 +762,16 @@ lacks. Combined with DAIRT's masks this yields *which hand* holds *which object*
 
 ## Licence
 
-DAIRT follows the licence of the upstream DART repository — see [`LICENSE`](LICENSE).
-SAM 3 model weights are subject to Meta's own licence, accepted at download time.
+**Two licence files are present and this needs a decision.**
+
+- [`LICENSE`](LICENSE) — the **SAM License**, inherited from the upstream DART
+  repository. DAIRT is a derivative work of DART, which is itself derived from
+  Meta's SAM 3, so these terms carry over to the inherited code.
+- [`LICENSE-APACHE-2.0`](LICENSE-APACHE-2.0) — Apache 2.0, chosen when this
+  repository was created. It may apply to the original DAIRT contributions, but
+  it cannot override the terms attached to the inherited code.
+
+Both are kept rather than one being silently dropped. Which applies to what is a
+call for the repository owner, and worth confirming before any redistribution.
+
+SAM 3 model weights carry Meta's own licence, accepted at download time.
