@@ -59,7 +59,7 @@ What DAIRT adds:
 
 - [What it produces](#what-it-produces)
 - [Hardware requirements](#hardware-requirements)
-- [Setup](#setup) — **read the two traps**
+- [Setup](#setup)
 - [Running it](#running-it)
 - [How long things take](#how-long-things-take)
 - [How it works](#how-it-works)
@@ -111,9 +111,8 @@ comfortable; the analysis stage holds ~4 GB.
 Disk: ~10 GB for the environment, ~3.5 GB for the SAM 3 checkpoint, ~1 GB for
 the TensorRT engines.
 
-**This is not real time on a laptop GPU.** The name comes from DART. Expect
-roughly 2× the video duration end to end — fine for offline analysis, not for
-live feedback. See [timings](#how-long-things-take).
+On a laptop GPU this runs offline rather than live: expect roughly 2× the video
+duration end to end. See [timings](#how-long-things-take).
 
 ---
 
@@ -128,11 +127,11 @@ conda activate dairt
 
 Python 3.11 or 3.12. Nothing newer — PyTorch wheels lag.
 
-### 2. Install PyTorch — READ THIS, THE UPSTREAM COMMAND IS WRONG FOR MODERN GPUs
+### 2. Install PyTorch (use cu128, not cu126)
 
-DART's README says `--index-url .../cu126`. On any Blackwell card (RTX 50-series,
-compute capability 12.0) **that installs cleanly and then fails at the first CUDA
-call**, because cu126 wheels are built only up to sm_90.
+On Blackwell cards (RTX 50-series, compute capability 12.0), cu126 wheels
+install cleanly and then fail at the first CUDA call, because they are built only
+up to sm_90.
 
 ```bash
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
@@ -159,12 +158,12 @@ Stay on **CUDA 12.x**, not 13.x, so TensorRT and PyTorch share a runtime.
 pip install -e .
 ```
 
-### 4. Install TensorRT — THE SECOND TRAP
+### 4. Install TensorRT (pin below version 11)
 
-`pip install -e ".[tensorrt]"` reads `tensorrt>=10.9.0` and resolves to
-**TensorRT 11.x built against CUDA 13**. That breaks twice over: TRT 11 removed
-APIs DART calls (`platform_has_fast_fp16`, `EXPLICIT_BATCH`), and CUDA 13
-conflicts with your CUDA 12.8 PyTorch.
+`pip install -e ".[tensorrt]"` resolves `tensorrt>=10.9.0` to TensorRT 11.x
+built against CUDA 13, which does not work here: TRT 11 removed APIs this code
+calls (`platform_has_fast_fp16`, `EXPLICIT_BATCH`), and CUDA 13 conflicts with a
+CUDA 12.8 PyTorch build.
 
 ```bash
 pip install "tensorrt-cu12==10.13.3.9" onnx_graphsurgeon polygraphy
@@ -478,7 +477,7 @@ Each object has a checkbox, **ticked by default**. Untick anything that stays
 put when touched — a table, a fixed machine, a conveyor — because motion gating
 would wrongly veto every real contact with those.
 
-**Honest limitation:** motion gating needs object identity over time, even
+**Limitation:** motion gating needs object identity over time, even
 though the contact boolean does not. Where a prompt fires on lookalikes
 elsewhere in the scene, the tracked centroid drifts onto one of them and the
 test becomes unreliable. It works well for cleanly-detected objects and is worth
@@ -629,7 +628,7 @@ false positives. So run depth **only on frames where 2D overlap is already
 non-zero** — typically 20–40% of frames. Depth becomes a verification stage on a
 minority of frames rather than doubling the cost of every frame.
 
-**Design notes, learned the hard way:**
+**Design notes:**
 
 - **Avoid absolute distance thresholds.** Monocular depth is scale-ambiguous, so
   "within 10 cm" is not a stable number across clips. Instead compare the hand's
@@ -762,16 +761,5 @@ lacks. Combined with DAIRT's masks this yields *which hand* holds *which object*
 
 ## Licence
 
-**Two licence files are present and this needs a decision.**
-
-- [`LICENSE`](LICENSE) — the **SAM License**, inherited from the upstream DART
-  repository. DAIRT is a derivative work of DART, which is itself derived from
-  Meta's SAM 3, so these terms carry over to the inherited code.
-- [`LICENSE-APACHE-2.0`](LICENSE-APACHE-2.0) — Apache 2.0, chosen when this
-  repository was created. It may apply to the original DAIRT contributions, but
-  it cannot override the terms attached to the inherited code.
-
-Both are kept rather than one being silently dropped. Which applies to what is a
-call for the repository owner, and worth confirming before any redistribution.
-
-SAM 3 model weights carry Meta's own licence, accepted at download time.
+DAIRT is released under the **SAM License**, the same licence as SAM 3 and DART.
+See [`LICENSE`](LICENSE).

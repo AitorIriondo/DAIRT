@@ -64,7 +64,6 @@ pip uninstall -y tensorrt tensorrt_cu13 tensorrt_cu13_bindings tensorrt_cu13_lib
 pip install "tensorrt-cu12==10.13.3.9"
 ```
 
-Worth reporting upstream: a `<11` bound would fix this for everyone installing today.
 
 ## The checkpoint is gated
 
